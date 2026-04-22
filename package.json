@@ -1,0 +1,121 @@
+{
+  "name": "vds-x",
+  "displayName": "VDS-X Agent",
+  "description": "Local AI coding agent — Ollama + ECC (layer B)",
+  "version": "0.5.0",
+  "publisher": "local",
+  "private": true,
+  "engines": {
+    "vscode": "^1.90.0",
+    "node": ">=18"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "vdsx.openChat",
+        "title": "VDS-X: Open Chat"
+      },
+      {
+        "command": "vdsx.reloadEcc",
+        "title": "VDS-X: Reload ECC definitions"
+      }
+    ],
+    "configuration": {
+      "title": "VDS-X",
+      "properties": {
+        "vdsx.ollama.host": {
+          "type": "string",
+          "default": "http://192.168.1.220:11434",
+          "description": "LLM server base URL. OpenAI-compatible /v1/chat/completions endpoint expected (llama.cpp, LM Studio, Ollama's OpenAI shim all work)."
+        },
+        "vdsx.ollama.model": {
+          "type": "string",
+          "default": "Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf",
+          "description": "Model id exactly as returned by /v1/models."
+        },
+        "vdsx.ollama.apiKey": {
+          "type": "string",
+          "default": "",
+          "description": "Bearer token for the LLM server. Required."
+        },
+        "vdsx.ollama.numCtx": {
+          "type": "number",
+          "default": 49152,
+          "description": "Advisory only — llama.cpp OpenAI endpoint ignores per-request num_ctx. Server 192.168.1.220 currently runs --ctx-size 49152. 64k tested OOMs on RTX 3060 during large-prompt inference; 48k is the safe ceiling."
+        },
+        "vdsx.ollama.temperature": {
+          "type": "number",
+          "default": 0.2
+        },
+        "vdsx.ollama.maxOutput": {
+          "type": "number",
+          "default": 12000,
+          "description": "Max output tokens per LLM response (llama.cpp n_predict). Caps runaway generation; most replies are far shorter."
+        },
+        "vdsx.eccPaths": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            ".claude",
+            "~/.claude"
+          ],
+          "description": "Directories to scan for ECC agents/commands/rules. Relative paths are resolved against workspace root."
+        },
+        "vdsx.maxIterations": {
+          "type": "number",
+          "default": 20,
+          "description": "Max agent loop iterations per user message."
+        },
+        "vdsx.autoApprove": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [
+            "read_file",
+            "grep",
+            "glob"
+          ],
+          "description": "Tool names that don't require approval."
+        },
+        "vdsx.contextFiles": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": ["CLAUDE.md", "AGENTS.md"],
+          "description": "Files loaded from workspace root and injected into the system prompt of every agent call (chat turn, /do phases). Caps at 8KB total."
+        },
+        "vdsx.phaseAgents": {
+          "type": "object",
+          "default": {
+            "plan": "planner",
+            "execute": "code-architect",
+            "fix": "build-error-resolver"
+          },
+          "description": "Maps /do orchestrator phases to ECC agent names. Each agent's body is injected as guidance into that phase's system prompt. Set a value to empty string to use the generic built-in prompt."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "typecheck": "tsc --noEmit",
+    "vscode:prepublish": "npm run build"
+  },
+  "dependencies": {
+    "gray-matter": "^4.0.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/vscode": "^1.90.0",
+    "esbuild": "^0.23.0",
+    "typescript": "^5.5.0"
+  }
+}

@@ -1,0 +1,10 @@
+node_modules/
+dist/
+*.vsix
+.vscode-test/
+.env
+.env.local
+test-sandbox/lib.js
+test-sandbox2/math.js
+test-sandbox2/test.js
+

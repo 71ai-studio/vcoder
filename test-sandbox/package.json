@@ -1,0 +1,8 @@
+{
+  "name": "vdsx-sandbox",
+  "version": "0.0.1",
+  "private": true,
+  "scripts": {
+    "test": "node -e \"const m=require('./lib'); if(typeof m.hello!=='function'){console.error('no hello fn');process.exit(1)} const r=m.hello(); if(r!=='hi'){console.error('got',r);process.exit(1)} console.log('OK')\""
+  }
+}
