@@ -12,6 +12,10 @@ export interface LoopOptions {
   onToolCall: (name: string, args: Record<string, unknown>) => void;
   onToolResult: (name: string, result: string) => void;
   shouldStop: () => boolean;
+  // Stream hooks — when provided, chat() runs with stream:true and each content delta is forwarded.
+  onStreamStart?: () => void;
+  onStreamChunk?: (delta: string) => void;
+  onStreamEnd?: (finalMessage: ChatMessage) => void;
 }
 
 export async function runAgent(
@@ -23,7 +27,15 @@ export async function runAgent(
   for (let i = 0; i < opts.maxIterations; i++) {
     if (opts.shouldStop()) break;
 
-    const assistant = await chat(opts.cfg, messages, schemas);
+    const streaming = Boolean(opts.onStreamChunk);
+    if (streaming) opts.onStreamStart?.();
+    const assistant = await chat(
+      opts.cfg,
+      messages,
+      schemas,
+      streaming ? { onChunk: opts.onStreamChunk, shouldAbort: () => opts.shouldStop() } : undefined
+    );
+    if (streaming) opts.onStreamEnd?.(assistant);
     messages.push(assistant);
     opts.onMessage(assistant);
 

@@ -87,7 +87,19 @@ export class ChatPanel {
   private isRenderable(msg: unknown): boolean {
     if (!msg || typeof msg !== 'object') return false;
     const t = (msg as { type?: string }).type;
+    // Stream events are transient UI directives — not tracked. Final assistant msg is tracked separately.
     return t === 'user' || t === 'assistant' || t === 'toolCall' || t === 'toolResult' || t === 'info' || t === 'phase' || t === 'error';
+  }
+
+  // Post a stream event directly to webview without log tracking
+  private streamStart(phase?: string) {
+    this.panel.webview.postMessage({ type: 'assistantStart', phase });
+  }
+  private streamChunk(delta: string) {
+    this.panel.webview.postMessage({ type: 'assistantChunk', delta });
+  }
+  private streamEnd() {
+    this.panel.webview.postMessage({ type: 'assistantEnd' });
   }
 
   private replayLog() {
@@ -459,16 +471,22 @@ export class ChatPanel {
   // Output language — post-response translation (A7)
   // ───────────────────────────────────────────────────────────────────────
 
-  private async translateSummary(text: string): Promise<string> {
+  private async translateSummaryStreamed(text: string): Promise<string> {
     if (this.outputLang === 'en' || !text.trim()) return text;
     const cfg = this.buildLlmConfig();
     if (!cfg) return text;
     this.post({ type: 'info', text: `Translating to ${LANG_NAMES[this.outputLang]}...` });
     const prompt = `Translate the following summary to ${LANG_NAMES[this.outputLang]}. Keep code blocks, file paths, command names, and technical terms UNCHANGED. Return ONLY the translation, no preamble, no explanation.\n\n---\n${text}`;
     try {
-      const resp = await chat({ ...cfg, temperature: 0.1 }, [{ role: 'user', content: prompt }], []);
+      this.streamStart(`translate → ${this.outputLang}`);
+      const resp = await chat({ ...cfg, temperature: 0.1 }, [{ role: 'user', content: prompt }], [], {
+        onChunk: (d) => this.streamChunk(d),
+        shouldAbort: () => this.stopFlag
+      });
+      this.streamEnd();
       return resp.content || text;
     } catch (e) {
+      this.streamEnd();
       this.post({ type: 'error', text: `Translation failed: ${e instanceof Error ? e.message : 'unknown'}` });
       return text;
     }
@@ -478,9 +496,9 @@ export class ChatPanel {
     if (this.outputLang === 'en') return;
     const last = [...this.history].reverse().find((m) => m.role === 'assistant' && m.content && m.content.trim());
     if (!last?.content) return;
-    const translated = await this.translateSummary(last.content);
+    const translated = await this.translateSummaryStreamed(last.content);
     if (translated && translated !== last.content) {
-      this.post({ type: 'assistant', text: `[${this.outputLang}] ${translated}` });
+      this.logs[this.mode].push({ type: 'assistant', text: `[${this.outputLang}] ${translated}` });
     }
   }
 
@@ -515,8 +533,13 @@ export class ChatPanel {
         catch (e) { this.post({ type: 'error', text: `Read failed ${this.toRel(a.path)}: ${e instanceof Error ? e.message : 'unknown'}` }); continue; }
         this.post({ type: 'info', text: `Translating ${this.toRel(a.path)} → ${targetLang}...` });
         const prompt = `Translate the content below to ${targetLang}. Preserve code fences, identifiers, file paths, and technical terms unchanged. Return ONLY the translated content.\n\n${content}`;
-        const resp = await chat({ ...llmCfg, temperature: 0.2 }, [{ role: 'user', content: prompt }], []);
-        this.post({ type: 'assistant', text: `### ${this.toRel(a.path)} (${targetLang})\n\n${resp.content || '(empty)'}` });
+        this.streamStart(`${this.toRel(a.path)} → ${targetLang}`);
+        const resp = await chat({ ...llmCfg, temperature: 0.2 }, [{ role: 'user', content: prompt }], [], {
+          onChunk: (d) => this.streamChunk(d),
+          shouldAbort: () => this.stopFlag
+        });
+        this.streamEnd();
+        this.logs[this.mode].push({ type: 'assistant', text: `### ${this.toRel(a.path)} (${targetLang})\n\n${resp.content || '(empty)'}` });
       }
       this.clearAttachments();
     } catch (e) {
@@ -552,13 +575,19 @@ export class ChatPanel {
         const req = [extraText.trim(), attachContent].filter(Boolean).join('\n\n');
         prompt = `Given the REQUIREMENT below, analyze whether the DIFF implements it. List: (1) what's covered, (2) gaps/missing, (3) potential issues.\n\nREQUIREMENT:\n${req}\n\nDIFF:\n\`\`\`diff\n${diff.slice(0, 60000)}\n\`\`\``;
       }
-      const resp = await chat({ ...llmCfg, temperature: 0.2 }, [{ role: 'user', content: prompt }], []);
-      this.post({ type: 'assistant', text: resp.content || '(empty)' });
+      this.streamStart('diff review');
+      const resp = await chat({ ...llmCfg, temperature: 0.2 }, [{ role: 'user', content: prompt }], [], {
+        onChunk: (d) => this.streamChunk(d),
+        shouldAbort: () => this.stopFlag
+      });
+      this.streamEnd();
       this.history.push({ role: 'user', content: prompt });
       this.history.push(resp);
+      if (resp.content) this.logs[this.mode].push({ type: 'assistant', text: resp.content });
       this.clearAttachments();
       await this.maybeTranslateLastAssistant();
     } catch (e) {
+      this.streamEnd();
       this.post({ type: 'error', text: e instanceof Error ? e.message : String(e) });
     } finally {
       this.panel.webview.postMessage({ type: 'running', value: false });
@@ -590,8 +619,13 @@ export class ChatPanel {
           const rel = this.toRel(f);
           this.post({ type: 'info', text: `Reviewing ${rel}...` });
           const prompt = `Review this file for bugs, security issues, and code smells. Be specific: cite line numbers or snippets. If clean, say so.\n\n## ${rel}\n\`\`\`\n${content}\n\`\`\``;
-          const resp = await chat({ ...llmCfg, temperature: 0.2 }, [{ role: 'user', content: prompt }], []);
-          this.post({ type: 'assistant', text: `### ${rel}\n\n${resp.content || '(no issues found)'}` });
+          this.streamStart(`review ${rel}`);
+          const resp = await chat({ ...llmCfg, temperature: 0.2 }, [{ role: 'user', content: prompt }], [], {
+            onChunk: (d) => this.streamChunk(d),
+            shouldAbort: () => this.stopFlag
+          });
+          this.streamEnd();
+          if (resp.content) this.logs[this.mode].push({ type: 'assistant', text: `### ${rel}\n\n${resp.content}` });
         }
         this.post({ type: 'info', text: 'Review complete.' });
       } else {
@@ -599,14 +633,20 @@ export class ChatPanel {
         const attachContent = this.readAttachmentsAsBlock();
         const prompt = `Review the attached code for bugs. PROPOSE fixes as unified diffs or code snippets. Do NOT describe, just show the fix. User will apply manually.\n\nGUIDANCE:\n${extraText || '(review attachments holistically)'}\n\n${attachContent}`;
         this.post({ type: 'info', text: 'Analyzing...' });
-        const resp = await chat({ ...llmCfg, temperature: 0.2 }, [{ role: 'user', content: prompt }], []);
-        this.post({ type: 'assistant', text: resp.content || '(empty)' });
+        this.streamStart('fixbug');
+        const resp = await chat({ ...llmCfg, temperature: 0.2 }, [{ role: 'user', content: prompt }], [], {
+          onChunk: (d) => this.streamChunk(d),
+          shouldAbort: () => this.stopFlag
+        });
+        this.streamEnd();
         this.history.push({ role: 'user', content: prompt });
         this.history.push(resp);
+        if (resp.content) this.logs[this.mode].push({ type: 'assistant', text: resp.content });
         this.clearAttachments();
         await this.maybeTranslateLastAssistant();
       }
     } catch (e) {
+      this.streamEnd();
       this.post({ type: 'error', text: e instanceof Error ? e.message : String(e) });
     } finally {
       this.panel.webview.postMessage({ type: 'running', value: false });
@@ -679,10 +719,15 @@ export class ChatPanel {
         const genPrompt = kind === 'pts'
           ? `Write unit tests for: ${t.purpose}.\nCover happy path, edge cases, error paths. Include setup/teardown if needed.\nDetect test framework from DIFF/attachments or default to Jest.\nOutput ONLY code — no preamble, no explanation.\n\nDIFF:\n\`\`\`diff\n${diff.slice(0, 30000) || '(no diff)'}\n\`\`\`\n\n${attachContent}\n\nCONTEXT:\n${extraText || '(none)'}`
           : `Write UAT/e2e test scenarios for: ${t.purpose}.\nFormat: Gherkin (Given/When/Then) OR numbered manual test steps.\nCover happy path, error states, edge UI states, accessibility concerns.\nOutput ONLY scenarios.\n\nDIFF:\n\`\`\`diff\n${diff.slice(0, 30000) || '(no diff)'}\n\`\`\`\n\n${attachContent}\n\nCONTEXT:\n${extraText || '(none)'}`;
-        const gen = await chat({ ...llmCfg, temperature: 0.2 }, [{ role: 'user', content: genPrompt }], []);
+        this.streamStart(`${kind} → ${rel}`);
+        const gen = await chat({ ...llmCfg, temperature: 0.2 }, [{ role: 'user', content: genPrompt }], [], {
+          onChunk: (d) => this.streamChunk(d),
+          shouldAbort: () => this.stopFlag
+        });
+        this.streamEnd();
         const body = (gen.content || '').replace(/^```[a-zA-Z]*\n?/, '').replace(/```\s*$/, '');
         fs.writeFileSync(abs, body, 'utf8');
-        this.post({ type: 'assistant', text: `Saved: ${rel}\n\n${body.slice(0, 1500)}${body.length > 1500 ? '\n[...]' : ''}` });
+        this.post({ type: 'info', text: `Saved: ${rel} (${body.length} bytes)` });
       }
       this.clearAttachments();
     } catch (e) {
@@ -763,7 +808,11 @@ export class ChatPanel {
             const bd = breakdownMessages(msgs);
             const st = estimateTokens(JSON.stringify(schemas));
             this.post({ type: 'info', text: `[${phase}] ${formatBreakdown(bd, st, llmCfg.numCtx)}` });
-          }
+          },
+          onStreamStart: (phase) => this.streamStart(phase),
+          onStreamChunk: (_phase, delta) => this.streamChunk(delta),
+          onStreamEnd: (_phase, _text) => this.streamEnd(),
+          shouldStop: () => this.stopFlag
         },
         {
           onPhase: (phase, info) => this.post({ type: 'phase', phase, info: info ?? '' }),
@@ -780,7 +829,7 @@ export class ChatPanel {
           onReport: async (md) => {
             this.post({ type: 'assistant', text: md });
             if (this.outputLang !== 'en') {
-              const translated = await this.translateSummary(md);
+              const translated = await this.translateSummaryStreamed(md);
               if (translated && translated !== md) {
                 this.post({ type: 'assistant', text: `[${this.outputLang}] ${translated}` });
               }
@@ -834,11 +883,17 @@ export class ChatPanel {
     this.panel.webview.postMessage({ type: 'running', value: true });
     try {
       if (this.stopFlag) return;
-      const reply = await chat(llmCfg, this.history, []);
+      this.streamStart();
+      const reply = await chat(llmCfg, this.history, [], {
+        onChunk: (delta) => this.streamChunk(delta),
+        shouldAbort: () => this.stopFlag
+      });
+      this.streamEnd();
       this.history.push(reply);
-      if (reply.content) this.post({ type: 'assistant', text: reply.content });
+      if (reply.content) this.logs[this.mode].push({ type: 'assistant', text: reply.content });
       await this.maybeTranslateLastAssistant();
     } catch (e) {
+      this.streamEnd();
       this.post({ type: 'error', text: e instanceof Error ? e.message : String(e) });
     } finally {
       this.panel.webview.postMessage({ type: 'running', value: false });
@@ -911,7 +966,8 @@ export class ChatPanel {
         autoApprove,
         ctx,
         onMessage: (m) => {
-          if (m.role === 'assistant' && m.content) this.post({ type: 'assistant', text: m.content });
+          // Stream already delivered content via chunks; we only need to track final assistant text in log
+          if (m.role === 'assistant' && m.content) this.logs[this.mode].push({ type: 'assistant', text: m.content });
         },
         onToolCall: (n, a) => this.post({ type: 'toolCall', name: n, args: a }),
         onToolResult: (n, r) => {
@@ -919,10 +975,14 @@ export class ChatPanel {
           this.post({ type: 'info', text: `tool ${n} → ${r.length} bytes (~${toks} tok)` });
           this.post({ type: 'toolResult', name: n, result: r.length > 4000 ? r.slice(0, 4000) + '\n[...truncated for UI]' : r });
         },
-        shouldStop: () => this.stopFlag
+        shouldStop: () => this.stopFlag,
+        onStreamStart: () => this.streamStart(),
+        onStreamChunk: (delta) => this.streamChunk(delta),
+        onStreamEnd: () => this.streamEnd()
       });
       await this.maybeTranslateLastAssistant();
     } catch (e) {
+      this.streamEnd();
       this.post({ type: 'error', text: e instanceof Error ? e.message : String(e) });
     } finally {
       this.panel.webview.postMessage({ type: 'running', value: false });
@@ -1051,6 +1111,15 @@ export class ChatPanel {
   }
   .user { background: var(--vscode-textBlockQuote-background); }
   .assistant { background: rgba(100,150,250,0.08); }
+  .assistant.streaming .body { white-space: pre-wrap; }
+  .assistant.thinking .body { color: var(--vscode-descriptionForeground); font-style: italic; }
+  .cursor-blink::after {
+    content: '▍';
+    margin-left: 1px;
+    animation: blink 1s infinite;
+    opacity: 0.6;
+  }
+  @keyframes blink { 0%, 50% { opacity: 0.6; } 51%, 100% { opacity: 0; } }
   .tool { background: rgba(200,150,50,0.08); font-family: var(--vscode-editor-font-family); font-size: 12px; }
   .result { background: rgba(100,200,100,0.06); font-family: var(--vscode-editor-font-family); font-size: 12px; }
   .error { background: rgba(250,100,100,0.12); }
@@ -1281,12 +1350,57 @@ export class ChatPanel {
   let currentMode = 'workflow';
   let currentAgent = '';
   let running = false;
+  let streamingBlock = null;  // DOM node currently receiving stream chunks
+  let streamingBodyEl = null; // body sub-element inside streamingBlock
+  let streamingFirstChunk = true;
   const sendBtn = document.getElementById('sendBtn');
 
   function setRunning(r) {
     running = r;
     if (r) { sendBtn.classList.add('stop'); sendBtn.textContent = '◼'; sendBtn.title = 'Stop generation'; }
     else { sendBtn.classList.remove('stop'); sendBtn.textContent = '↑'; sendBtn.title = 'Send (Ctrl+Enter)'; }
+  }
+
+  function startStream(phase) {
+    const d = document.createElement('div');
+    d.className = 'msg assistant streaming thinking';
+    const h = document.createElement('div');
+    h.className = 'label';
+    h.textContent = phase ? 'Assistant · ' + phase : 'Assistant';
+    d.appendChild(h);
+    const b = document.createElement('div');
+    b.className = 'body cursor-blink';
+    b.textContent = 'thinking...';
+    d.appendChild(b);
+    log.appendChild(d);
+    log.scrollTop = log.scrollHeight;
+    streamingBlock = d;
+    streamingBodyEl = b;
+    streamingFirstChunk = true;
+  }
+
+  function appendStreamChunk(delta) {
+    if (!streamingBlock || !streamingBodyEl) return;
+    if (streamingFirstChunk) {
+      streamingBodyEl.textContent = '';
+      streamingBlock.classList.remove('thinking');
+      streamingFirstChunk = false;
+    }
+    streamingBodyEl.textContent += delta;
+    log.scrollTop = log.scrollHeight;
+  }
+
+  function endStream() {
+    if (!streamingBlock) return;
+    streamingBlock.classList.remove('streaming');
+    if (streamingBodyEl) streamingBodyEl.classList.remove('cursor-blink');
+    // If nothing streamed (pure tool call with no text), drop the empty thinking block
+    if (streamingFirstChunk) {
+      streamingBlock.remove();
+    }
+    streamingBlock = null;
+    streamingBodyEl = null;
+    streamingFirstChunk = true;
   }
 
   function add(cls, label, text) {
@@ -1364,7 +1478,10 @@ export class ChatPanel {
     const m = e.data;
     if (m.type === 'user') add('user', 'You', m.text);
     else if (m.type === 'assistant') add('assistant', 'Assistant', m.text);
-    else if (m.type === 'toolCall') add('tool', 'Tool call: ' + m.name, JSON.stringify(m.args, null, 2));
+    else if (m.type === 'assistantStart') startStream(m.phase);
+    else if (m.type === 'assistantChunk') appendStreamChunk(m.delta || '');
+    else if (m.type === 'assistantEnd') endStream();
+    else if (m.type === 'toolCall') { endStream(); add('tool', 'Tool call: ' + m.name, JSON.stringify(m.args, null, 2)); }
     else if (m.type === 'toolResult') add('result', 'Result: ' + m.name, m.result);
     else if (m.type === 'info') add('info', '', m.text);
     else if (m.type === 'phase') add('info', '', 'Phase ' + m.phase + (m.info ? ': ' + m.info : ''));

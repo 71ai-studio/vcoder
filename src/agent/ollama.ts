@@ -208,18 +208,25 @@ function toWire(m: ChatMessage, fallbackCallId: string): Record<string, unknown>
   return { role: m.role, content: m.content };
 }
 
+export interface StreamHooks {
+  onChunk?: (delta: string) => void;
+  shouldAbort?: () => boolean;
+}
+
 export async function chat(
   cfg: LlmConfig,
   messages: ChatMessage[],
-  tools: unknown[]
+  tools: unknown[],
+  stream?: StreamHooks
 ): Promise<ChatMessage> {
   const url = normalizeHost(cfg.host) + '/chat/completions';
+  const streaming = Boolean(stream?.onChunk);
   const body: Record<string, unknown> = {
     model: cfg.model,
     messages: messages.map((m, i) => toWire(m, `call_${i}`)),
     temperature: cfg.temperature,
     max_tokens: cfg.maxOutput ?? 12000,
-    stream: false
+    stream: streaming
   };
   if (tools && tools.length > 0) body.tools = tools;
 
@@ -236,11 +243,74 @@ export async function chat(
     const txt = await res.text();
     throw new Error(`LLM HTTP ${res.status}: ${txt.slice(0, 500)}`);
   }
-  const data = (await res.json()) as Record<string, unknown>;
-  const choices = data.choices as Array<{ message?: Record<string, unknown> }> | undefined;
-  const msg = choices?.[0]?.message;
-  if (!msg) throw new Error('LLM: empty response (no choices[0].message)');
-  return normalizeAssistant(msg);
+
+  if (!streaming) {
+    const data = (await res.json()) as Record<string, unknown>;
+    const choices = data.choices as Array<{ message?: Record<string, unknown> }> | undefined;
+    const msg = choices?.[0]?.message;
+    if (!msg) throw new Error('LLM: empty response (no choices[0].message)');
+    return normalizeAssistant(msg);
+  }
+
+  // SSE streaming path
+  if (!res.body) throw new Error('LLM: no response body for stream');
+  const reader = (res.body as unknown as { getReader(): { read(): Promise<{ value?: Uint8Array; done: boolean }>; cancel(): Promise<void> } }).getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let content = '';
+  const toolCallAccum: Array<{ id?: string; function: { name?: string; arguments?: string } }> = [];
+
+  const processLine = (line: string) => {
+    const trimmed = line.trim();
+    if (!trimmed.startsWith('data:')) return;
+    const payload = trimmed.slice(5).trim();
+    if (payload === '[DONE]') return;
+    let parsed: Record<string, unknown>;
+    try { parsed = JSON.parse(payload) as Record<string, unknown>; } catch { return; }
+    const choices = parsed.choices as Array<{ delta?: Record<string, unknown> }> | undefined;
+    const delta = choices?.[0]?.delta;
+    if (!delta) return;
+    const deltaContent = delta.content;
+    if (typeof deltaContent === 'string' && deltaContent.length > 0) {
+      content += deltaContent;
+      stream?.onChunk?.(deltaContent);
+    }
+    const deltaTools = delta.tool_calls as Array<Record<string, unknown>> | undefined;
+    if (Array.isArray(deltaTools)) {
+      for (const tc of deltaTools) {
+        const idx = typeof tc.index === 'number' ? tc.index : 0;
+        if (!toolCallAccum[idx]) toolCallAccum[idx] = { function: {} };
+        const entry = toolCallAccum[idx];
+        if (typeof tc.id === 'string') entry.id = tc.id;
+        const fn = tc.function as { name?: string; arguments?: string } | undefined;
+        if (fn?.name) entry.function.name = fn.name;
+        if (fn?.arguments) entry.function.arguments = (entry.function.arguments ?? '') + fn.arguments;
+      }
+    }
+  };
+
+  try {
+    while (true) {
+      if (stream?.shouldAbort?.()) {
+        try { await reader.cancel(); } catch { /* ignore */ }
+        break;
+      }
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (value) buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+      for (const line of lines) processLine(line);
+    }
+    if (buffer.trim()) processLine(buffer);
+  } catch (e) {
+    throw new Error(`LLM stream error: ${e instanceof Error ? e.message : String(e)}`);
+  }
+
+  const finalMsg: Record<string, unknown> = { content };
+  const nonEmptyTools = toolCallAccum.filter((tc) => tc && tc.function && tc.function.name);
+  if (nonEmptyTools.length > 0) finalMsg.tool_calls = nonEmptyTools;
+  return normalizeAssistant(finalMsg);
 }
 
 /**
