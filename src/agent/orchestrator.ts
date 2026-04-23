@@ -51,6 +51,7 @@ export interface OrchestratorOptions {
   maxFixAttempts: number; // e.g. 3
   phaseAgents?: Record<string, string>; // phase name → ECC agent body (already trimmed)
   contextFiles?: string; // concatenated CLAUDE.md / AGENTS.md content
+  onLlmCall?: (phase: string, msgs: ChatMessage[], schemas: unknown[]) => void; // Phase-0 instrumentation
 }
 
 function buildSystemPrompt(phaseBase: string, agentBody?: string, contextFiles?: string): string {
@@ -69,12 +70,13 @@ const FIX_CAP_DEFAULT = 3;
 // ───────────────────────────────────────────────────────────────────────────────
 // Phase 1 — READ: enrich the user goal (one-shot LLM call, no tools)
 // ───────────────────────────────────────────────────────────────────────────────
-async function phaseRead(cfg: LlmConfig, goal: string, contextFiles?: string): Promise<string> {
+async function phaseRead(cfg: LlmConfig, goal: string, contextFiles?: string, onLlmCall?: OrchestratorOptions['onLlmCall']): Promise<string> {
   const base = 'You are an engineering analyst. Given a user goal, produce a concise enriched spec (max 300 words) listing: (a) what files are likely involved, (b) constraints/edge cases, (c) how success is verified. No code. No JSON yet — just prose.';
   const msgs: ChatMessage[] = [
     { role: 'system', content: buildSystemPrompt(base, undefined, contextFiles) },
     { role: 'user', content: `Goal:\n${goal}` }
   ];
+  onLlmCall?.('READ', msgs, []);
   const res = await chat(cfg, msgs, []);
   return res.content || goal;
 }
@@ -82,7 +84,7 @@ async function phaseRead(cfg: LlmConfig, goal: string, contextFiles?: string): P
 // ───────────────────────────────────────────────────────────────────────────────
 // Phase 2 — PLAN: produce strict JSON Plan
 // ───────────────────────────────────────────────────────────────────────────────
-async function phasePlan(cfg: LlmConfig, enrichedSpec: string, agentBody?: string, contextFiles?: string): Promise<Plan> {
+async function phasePlan(cfg: LlmConfig, enrichedSpec: string, agentBody?: string, contextFiles?: string, onLlmCall?: OrchestratorOptions['onLlmCall']): Promise<Plan> {
   const schemaExample: Plan = {
     summary: '1-line summary',
     test_command: 'npm test',
@@ -112,6 +114,7 @@ async function phasePlan(cfg: LlmConfig, enrichedSpec: string, agentBody?: strin
     { role: 'system', content: buildSystemPrompt(base, agentBody, contextFiles) },
     { role: 'user', content: `Enriched spec:\n${enrichedSpec}` }
   ];
+  onLlmCall?.('PLAN', msgs, []);
   const res = await chat(cfg, msgs, []);
   return parsePlan(res.content);
 }
@@ -184,7 +187,8 @@ async function phaseExecute(
   ctx: ToolContext,
   shouldStop: () => boolean,
   agentBody?: string,
-  contextFiles?: string
+  contextFiles?: string,
+  onLlmCall?: OrchestratorOptions['onLlmCall']
 ): Promise<string> {
   const base = [
     'You are a senior engineer executing ONE task. You have tools: read_file, write_file, edit_file, grep, glob.',
@@ -211,6 +215,15 @@ async function phaseExecute(
     }
   ];
 
+  const execSchemas = [
+    ALL_TOOLS.read_file.schema,
+    ALL_TOOLS.write_file.schema,
+    ALL_TOOLS.edit_file.schema,
+    ALL_TOOLS.grep.schema,
+    ALL_TOOLS.glob.schema
+  ];
+  onLlmCall?.(`EXECUTE:${task.id}`, messages, execSchemas);
+
   let lastText = '';
   await runAgent(messages, {
     cfg,
@@ -223,6 +236,7 @@ async function phaseExecute(
     onToolResult: () => {},
     shouldStop
   });
+  onLlmCall?.(`EXECUTE:${task.id}:done`, messages, execSchemas);
   return lastText;
 }
 
@@ -248,12 +262,13 @@ async function phaseTest(
 // ───────────────────────────────────────────────────────────────────────────────
 // Phase 5 — FIX: summarize test failure into a hint for the next execute attempt
 // ───────────────────────────────────────────────────────────────────────────────
-async function phaseFix(cfg: LlmConfig, taskTitle: string, testOutput: string, agentBody?: string, contextFiles?: string): Promise<string> {
+async function phaseFix(cfg: LlmConfig, taskTitle: string, testOutput: string, agentBody?: string, contextFiles?: string, onLlmCall?: OrchestratorOptions['onLlmCall']): Promise<string> {
   const base = 'Summarize a failing test output into a concise hint (max 150 words) pointing at the root cause. List: (1) what failed, (2) probable file:line, (3) one concrete fix direction. No code.';
   const msgs: ChatMessage[] = [
     { role: 'system', content: buildSystemPrompt(base, agentBody, contextFiles) },
     { role: 'user', content: `Task: ${taskTitle}\n\nTest output:\n${testOutput.slice(-4000)}` }
   ];
+  onLlmCall?.('FIX', msgs, []);
   const res = await chat(cfg, msgs, []);
   return res.content || '(fix phase returned no hint)';
 }
@@ -261,32 +276,36 @@ async function phaseFix(cfg: LlmConfig, taskTitle: string, testOutput: string, a
 // ───────────────────────────────────────────────────────────────────────────────
 // Phase 6 — REPORT: final markdown summary
 // ───────────────────────────────────────────────────────────────────────────────
-function buildReport(plan: Plan, outcomes: TaskOutcome[], finalTestOutput: string): string {
-  const pass = outcomes.filter((o) => o.status === 'passed').length;
-  const fail = outcomes.filter((o) => o.status === 'failed').length;
-  const skip = outcomes.filter((o) => o.status === 'skipped').length;
-  const verdict = fail === 0 && skip === 0 ? 'ALL PASSED' : fail === 0 ? 'PARTIAL' : 'FAILED';
+function buildReport(plan: Plan, outcomes: TaskOutcome[], v: RunVerdict): string {
+  const executed = outcomes.filter((o) => o.status === 'executed').length;
+  const errored = outcomes.filter((o) => o.status === 'errored').length;
+  const skipped = outcomes.filter((o) => o.status === 'skipped').length;
+  const verdictLabel = v.testPassed
+    ? 'PASSED'
+    : errored > 0 || skipped > 0
+      ? 'FAILED'
+      : 'TESTS FAILED';
 
   const lines: string[] = [];
   lines.push(`### Report: ${plan.summary}`);
   lines.push('');
   for (const o of outcomes) {
-    const mark = o.status === 'passed' ? 'x' : o.status === 'skipped' ? '-' : ' ';
-    const suffix = o.status === 'passed'
-      ? ` (${o.attempts} attempt${o.attempts === 1 ? '' : 's'})`
+    const mark = o.status === 'executed' ? 'x' : o.status === 'skipped' ? '-' : ' ';
+    const suffix = o.status === 'executed'
+      ? ''
       : o.status === 'skipped'
         ? ' (skipped)'
-        : ` (failed after ${o.attempts} — ${o.notes.replace(/\n/g, ' ').slice(0, 80)})`;
+        : ` (errored — ${o.notes.replace(/\n/g, ' ').slice(0, 80)})`;
     lines.push(`* [${mark}] **${o.id}** — ${o.title}${suffix}`);
   }
   lines.push('');
-  lines.push(`${verdict} · pass ${pass} / fail ${fail} / skip ${skip} · test: \`${plan.test_command}\``);
-  if (fail > 0) {
+  lines.push(`${verdictLabel} · executed ${executed} / errored ${errored} / skipped ${skipped} · fix retries ${v.fixAttempts} · test: \`${plan.test_command}\``);
+  if (!v.testPassed) {
     lines.push('');
     lines.push('<details><summary>Last test output</summary>');
     lines.push('');
     lines.push('```');
-    lines.push(finalTestOutput.slice(-2000));
+    lines.push(v.finalTestOutput.slice(-2000));
     lines.push('```');
     lines.push('</details>');
   }
@@ -308,12 +327,12 @@ export async function orchestrate(
   // 1. READ
   cb.onPhase('READ', 'enriching goal');
   if (cb.shouldStop()) return;
-  const enriched = await phaseRead(opts.cfg, opts.goal, ctxFiles);
+  const enriched = await phaseRead(opts.cfg, opts.goal, ctxFiles, opts.onLlmCall);
 
   // 2. PLAN
   cb.onPhase('PLAN', 'generating JSON plan');
   if (cb.shouldStop()) return;
-  const plan = await phasePlan(opts.cfg, enriched, pa.plan, ctxFiles);
+  const plan = await phasePlan(opts.cfg, enriched, pa.plan, ctxFiles, opts.onLlmCall);
   cb.onPhase('PLAN', `${plan.tasks.length} tasks — awaiting approval`);
 
   const approved = await cb.onPlan(plan);
@@ -332,7 +351,7 @@ export async function orchestrate(
     }
     cb.onPhase('EXECUTE', task.id);
     try {
-      const note = await phaseExecute(opts.cfg, task, undefined, opts.ctx, cb.shouldStop, pa.execute, ctxFiles);
+      const note = await phaseExecute(opts.cfg, task, undefined, opts.ctx, cb.shouldStop, pa.execute, ctxFiles, opts.onLlmCall);
       outcomes.push({ id: task.id, title: task.title, status: 'executed', notes: note.slice(0, 120) });
     } catch (e) {
       outcomes.push({
@@ -353,7 +372,7 @@ export async function orchestrate(
   while (!testRes.passed && fixAttempts < maxFix && !cb.shouldStop()) {
     fixAttempts++;
     cb.onPhase('FIX', `analyzing failure (retry ${fixAttempts}/${maxFix})`);
-    const hint = await phaseFix(opts.cfg, plan.summary, testRes.output, pa.fix, ctxFiles);
+    const hint = await phaseFix(opts.cfg, plan.summary, testRes.output, pa.fix, ctxFiles, opts.onLlmCall);
     if (cb.shouldStop()) break;
 
     const allFiles = [...new Set(plan.tasks.flatMap((t) => t.files))];
@@ -366,7 +385,7 @@ export async function orchestrate(
     };
     cb.onPhase('EXECUTE', fixTask.id);
     try {
-      await phaseExecute(opts.cfg, fixTask, hint, opts.ctx, cb.shouldStop, pa.execute, ctxFiles);
+      await phaseExecute(opts.cfg, fixTask, hint, opts.ctx, cb.shouldStop, pa.execute, ctxFiles, opts.onLlmCall);
     } catch (e) {
       // continue — next test run will reveal state
     }

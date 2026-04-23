@@ -99,6 +99,16 @@
             "fix": "build-error-resolver"
           },
           "description": "Maps /do orchestrator phases to ECC agent names. Each agent's body is injected as guidance into that phase's system prompt. Set a value to empty string to use the generic built-in prompt."
+        },
+        "vdsx.modeHistory": {
+          "type": "string",
+          "enum": ["auto-clear", "separate"],
+          "enumDescriptions": [
+            "Clear conversation when switching between Chat and Workflow modes (safest, avoids tool messages confusing a chat-mode LLM).",
+            "Keep independent conversation per mode — prior messages restored when you switch back."
+          ],
+          "default": "auto-clear",
+          "description": "How conversation history behaves when you switch between Chat and Workflow modes."
         }
       }
     }
