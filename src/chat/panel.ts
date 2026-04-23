@@ -1,4 +1,6 @@
 import * as vscode from 'vscode';
+import * as fs from 'fs';
+import * as path from 'path';
 import { ChatMessage, LlmConfig, chat, probe } from '../agent/ollama';
 import { runAgent } from '../agent/loop';
 import { ToolContext } from '../agent/tools/types';
@@ -6,16 +8,53 @@ import { loadEcc, buildSystemPrompt, AgentDef, EccBundle } from '../ecc/loader';
 import { loadContextFiles, resolvePhaseAgents } from '../ecc/context-files';
 import { orchestrate, planToMarkdown, Plan } from '../agent/orchestrator';
 import { breakdownMessages, estimateTokens, formatBreakdown } from '../agent/token-estimate';
-import { getSchemas } from '../agent/tools/registry';
+import { getSchemas, ALL_TOOLS } from '../agent/tools/registry';
+import { ensureVdsxDir, timestamp } from '../util/vdsx-dir';
+import { runGitDiff, saveDiffToVdsx, isGitRepo } from '../util/git-helpers';
 
 type Mode = 'chat' | 'workflow';
+type PermMode = 'ask' | 'auto-edit' | 'plan' | 'auto' | 'bypass';
+type OutputLang = 'en' | 'vi' | 'ja';
+
+interface Attachment {
+  path: string;
+  type: 'file' | 'folder';
+}
+
+interface ModelEntry {
+  label: string;
+  model: string;
+  host?: string;
+  apiKey?: string;
+}
 
 interface IncomingMsg {
-  type: 'send' | 'stop' | 'selectAgent' | 'reloadEcc' | 'setMode' | 'clearHistory';
+  type:
+    | 'send' | 'stop' | 'selectAgent' | 'reloadEcc' | 'setMode' | 'clearHistory'
+    | 'addActiveFile' | 'addActiveFolder' | 'removeAttachment'
+    | 'openPermPicker' | 'setPermMode'
+    | 'openLanguagePicker' | 'setLanguage'
+    | 'openModelPicker' | 'setModel'
+    | 'toggleThinking';
   text?: string;
   agent?: string;
   mode?: Mode;
+  value?: string;
 }
+
+const PERM_LABELS: Record<PermMode, string> = {
+  'ask': 'Ask before edits',
+  'auto-edit': 'Edit automatically',
+  'plan': 'Plan mode',
+  'auto': 'Auto mode',
+  'bypass': 'Bypass permissions'
+};
+
+const LANG_NAMES: Record<OutputLang, string> = {
+  'en': 'English',
+  'vi': 'Vietnamese',
+  'ja': 'Japanese'
+};
 
 export class ChatPanel {
   private static current: ChatPanel | undefined;
@@ -27,6 +66,11 @@ export class ChatPanel {
   private logs: Record<Mode, unknown[]> = { chat: [], workflow: [] };
   private stopFlag = false;
   private mode: Mode = 'workflow';
+  private attachments: Attachment[] = [];
+  private permMode: PermMode = 'ask';
+  private outputLang: OutputLang = 'en';
+  private thinking: boolean = false;
+  private modelOverride: ModelEntry | null = null;
 
   private get history(): ChatMessage[] {
     return this.histories[this.mode];
@@ -73,7 +117,19 @@ export class ChatPanel {
   constructor(panel: vscode.WebviewPanel, private context: vscode.ExtensionContext) {
     this.panel = panel;
     this.panel.webview.html = this.html();
+
+    // Load defaults from config
+    const cfg = vscode.workspace.getConfiguration('vdsx');
+    this.permMode = (cfg.get<string>('defaultPermissionMode', 'ask') as PermMode);
+    this.outputLang = (cfg.get<string>('outputLanguage', 'en') as OutputLang);
+
     this.reloadEcc();
+
+    // Post initial UI state
+    this.panel.webview.postMessage({ type: 'permModeChanged', label: PERM_LABELS[this.permMode] });
+    this.panel.webview.postMessage({ type: 'languageChanged', value: this.outputLang });
+    this.panel.webview.postMessage({ type: 'thinkingChanged', value: this.thinking });
+    this.panel.webview.postMessage({ type: 'modelChanged', label: '' });
 
     this.panel.webview.onDidReceiveMessage(
       (m: IncomingMsg) => this.onIncoming(m),
@@ -141,23 +197,60 @@ export class ChatPanel {
       return;
     }
     if (msg.type === 'stop') { this.stopFlag = true; return; }
+
+    // UI-driven configuration actions
+    if (msg.type === 'addActiveFile') { this.addActiveFile(); return; }
+    if (msg.type === 'addActiveFolder') { this.addActiveFolder(); return; }
+    if (msg.type === 'removeAttachment') {
+      const idx = parseInt(msg.value ?? '', 10);
+      if (!isNaN(idx)) this.removeAttachment(idx);
+      return;
+    }
+    if (msg.type === 'openPermPicker') { await this.openPermPicker(); return; }
+    if (msg.type === 'openLanguagePicker') { await this.openLanguagePicker(); return; }
+    if (msg.type === 'openModelPicker') { await this.openModelPicker(); return; }
+    if (msg.type === 'toggleThinking') { this.toggleThinking(); return; }
+
     if (msg.type === 'send' && msg.text) {
       this.stopFlag = false;
       const trimmed = msg.text.trim();
-      const isDo = trimmed.toLowerCase().startsWith('/do ');
-      const isHelp = trimmed.toLowerCase() === '/help' || trimmed === '/?';
-      if (isHelp) {
-        this.post({ type: 'info', text: 'Modes:\n  Chat     — pure conversation, no tools, no file access.\n  Workflow — tools (read/write/edit/bash/grep/glob) + /do <goal> orchestrator.\n\nCommands (Workflow only):\n  /do <goal>  — plan → execute → test → fix → report' });
+      const lower = trimmed.toLowerCase();
+
+      // Slash command routing — handled explicitly before chat/workflow dispatch
+      if (lower === '/help' || lower === '/?') {
+        this.post({ type: 'info', text: 'Modes:\n  Chat     — pure conversation, no tools.\n  Workflow — tools + agent loop.\n\nSlash commands:\n  /translate                — translate attached files to output language\n  /diffreview [requirements]— analyze git diff vs requirements\n  /fixbug [guidance]        — review/fix bugs (whole project or attachments)\n  /pts [context]            — generate unit tests from diff + attachments\n  /its [context]            — generate UAT tests from diff + attachments\n  /do <goal>                — run full plan→execute→test→fix orchestrator\n  /help                     — this list' });
         return;
       }
-      if (isDo) {
-        if (this.mode !== 'workflow') {
-          this.post({ type: 'info', text: '/do is only available in Workflow mode. Switch mode via toolbar.' });
-          return;
-        }
+      if (lower.startsWith('/do ')) {
+        if (this.mode !== 'workflow') { this.post({ type: 'info', text: '/do requires Workflow mode.' }); return; }
         await this.runDo(trimmed.slice(4).trim());
         return;
       }
+      if (lower === '/translate' || lower.startsWith('/translate ')) {
+        await this.cmdTranslate(trimmed.slice(10).trim());
+        return;
+      }
+      if (lower === '/diffreview' || lower.startsWith('/diffreview ')) {
+        if (this.mode !== 'workflow') { this.post({ type: 'info', text: '/diffreview requires Workflow mode.' }); return; }
+        await this.cmdDiffReview(trimmed.slice(11).trim());
+        return;
+      }
+      if (lower === '/fixbug' || lower.startsWith('/fixbug ')) {
+        if (this.mode !== 'workflow') { this.post({ type: 'info', text: '/fixbug requires Workflow mode.' }); return; }
+        await this.cmdFixBug(trimmed.slice(7).trim());
+        return;
+      }
+      if (lower === '/pts' || lower.startsWith('/pts ')) {
+        if (this.mode !== 'workflow') { this.post({ type: 'info', text: '/pts requires Workflow mode.' }); return; }
+        await this.cmdPts(trimmed.slice(4).trim());
+        return;
+      }
+      if (lower === '/its' || lower.startsWith('/its ')) {
+        if (this.mode !== 'workflow') { this.post({ type: 'info', text: '/its requires Workflow mode.' }); return; }
+        await this.cmdIts(trimmed.slice(4).trim());
+        return;
+      }
+
       if (this.mode === 'chat') {
         await this.runChat(trimmed);
       } else {
@@ -166,16 +259,427 @@ export class ChatPanel {
     }
   }
 
+  // ───────────────────────────────────────────────────────────────────────
+  // Attachments (A6)
+  // ───────────────────────────────────────────────────────────────────────
+
+  private addActiveFile() {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor) { this.post({ type: 'error', text: 'No active editor. Open a file first.' }); return; }
+    const p = editor.document.uri.fsPath;
+    if (this.attachments.some((a) => a.path === p && a.type === 'file')) {
+      this.post({ type: 'info', text: `Already attached: ${path.basename(p)}` });
+      return;
+    }
+    this.attachments.push({ path: p, type: 'file' });
+    this.broadcastAttachments();
+    this.post({ type: 'info', text: `Attached file: ${path.basename(p)}` });
+  }
+
+  private addActiveFolder() {
+    const editor = vscode.window.activeTextEditor;
+    if (!editor) { this.post({ type: 'error', text: 'No active editor. Open a file inside the target folder first.' }); return; }
+    const folder = path.dirname(editor.document.uri.fsPath);
+    if (this.attachments.some((a) => a.path === folder && a.type === 'folder')) {
+      this.post({ type: 'info', text: `Already attached: ${path.basename(folder)}` });
+      return;
+    }
+    this.attachments.push({ path: folder, type: 'folder' });
+    this.broadcastAttachments();
+    this.post({ type: 'info', text: `Attached folder: ${path.basename(folder)}/` });
+  }
+
+  private removeAttachment(idx: number) {
+    if (idx < 0 || idx >= this.attachments.length) return;
+    const removed = this.attachments.splice(idx, 1)[0];
+    this.broadcastAttachments();
+    if (removed) this.post({ type: 'info', text: `Removed: ${path.basename(removed.path)}` });
+  }
+
+  private clearAttachments() {
+    if (this.attachments.length === 0) return;
+    this.attachments = [];
+    this.broadcastAttachments();
+  }
+
+  private broadcastAttachments() {
+    this.panel.webview.postMessage({ type: 'attachments', items: this.attachments });
+  }
+
+  private toRel(p: string): string {
+    const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!ws) return p;
+    const rel = path.relative(ws, p).replace(/\\/g, '/');
+    return rel || path.basename(p);
+  }
+
+  private readAttachmentsAsBlock(maxBytes: number = 16000): string {
+    if (this.attachments.length === 0) return '';
+    const parts: string[] = [];
+    let total = 0;
+    for (const a of this.attachments) {
+      if (total >= maxBytes) { parts.push('[...more attachments truncated]'); break; }
+      const rel = this.toRel(a.path);
+      if (a.type === 'file') {
+        try {
+          let content = fs.readFileSync(a.path, 'utf8');
+          const budget = maxBytes - total - rel.length - 20;
+          if (content.length > budget) content = content.slice(0, Math.max(200, budget)) + '\n[...truncated]';
+          parts.push(`## ${rel}\n\`\`\`\n${content}\n\`\`\``);
+          total += content.length + rel.length + 20;
+        } catch (e) {
+          parts.push(`## ${rel}\n[error reading: ${e instanceof Error ? e.message : 'unknown'}]`);
+        }
+      } else {
+        try {
+          const entries = fs.readdirSync(a.path, { withFileTypes: true })
+            .filter((d: fs.Dirent) => !d.name.startsWith('.') && d.name !== 'node_modules' && d.name !== 'dist')
+            .slice(0, 60)
+            .map((d: fs.Dirent) => d.isDirectory() ? d.name + '/' : d.name)
+            .join('\n');
+          parts.push(`## ${rel}/ (folder listing)\n${entries || '(empty)'}`);
+          total += entries.length + rel.length + 30;
+        } catch {
+          parts.push(`## ${rel}\n[error listing folder]`);
+        }
+      }
+    }
+    return '<attachments>\n' + parts.join('\n\n') + '\n</attachments>';
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Pickers via VSCode QuickPick (A5/A7/A9/A10)
+  // ───────────────────────────────────────────────────────────────────────
+
+  private async openPermPicker() {
+    const items = (Object.keys(PERM_LABELS) as PermMode[]).map((v) => ({
+      label: PERM_LABELS[v],
+      detail: this.permDetail(v),
+      value: v,
+      picked: v === this.permMode
+    }));
+    const pick = await vscode.window.showQuickPick(items, { placeHolder: `Current: ${PERM_LABELS[this.permMode]}` });
+    if (!pick) return;
+    this.permMode = pick.value;
+    this.panel.webview.postMessage({ type: 'permModeChanged', label: PERM_LABELS[this.permMode] });
+    this.post({ type: 'info', text: `Permission mode: ${PERM_LABELS[this.permMode]}` });
+  }
+
+  private effectiveAutoApprove(): Set<string> {
+    const cfg = vscode.workspace.getConfiguration('vdsx');
+    const baseArr = cfg.get<string[]>('autoApprove', ['read_file', 'grep', 'glob']);
+    const base = new Set(baseArr);
+    if (this.permMode === 'bypass') return new Set(['read_file', 'write_file', 'edit_file', 'grep', 'glob', 'bash']);
+    if (this.permMode === 'auto') return new Set(['read_file', 'write_file', 'edit_file', 'grep', 'glob']);
+    if (this.permMode === 'auto-edit') { base.add('edit_file'); base.add('write_file'); return base; }
+    // 'ask' and 'plan' both use base (plan mode enforces deny at askApproval level)
+    return base;
+  }
+
+  private permDetail(m: PermMode): string {
+    return {
+      'ask': 'Approval modal for every risky tool (safest).',
+      'auto-edit': 'Auto-approve edit_file & write_file; ask bash.',
+      'plan': 'Read-only — deny write/edit/bash.',
+      'auto': 'Auto-approve all non-bash; ask bash.',
+      'bypass': 'Auto-approve EVERY tool incl. bash (DANGEROUS).'
+    }[m];
+  }
+
+  private async openLanguagePicker() {
+    const items: Array<{ label: string; value: OutputLang; detail?: string }> = [
+      { label: 'English', value: 'en', detail: 'No translation' },
+      { label: 'Tiếng Việt', value: 'vi', detail: 'Translate summaries to Vietnamese' },
+      { label: '日本語', value: 'ja', detail: 'Translate summaries to Japanese' }
+    ];
+    const pick = await vscode.window.showQuickPick(items, { placeHolder: `Current: ${LANG_NAMES[this.outputLang]}` });
+    if (!pick) return;
+    this.outputLang = pick.value;
+    this.panel.webview.postMessage({ type: 'languageChanged', value: this.outputLang });
+    this.post({ type: 'info', text: `Output language: ${pick.label}` });
+  }
+
+  private async openModelPicker() {
+    const cfg = vscode.workspace.getConfiguration('vdsx');
+    const extras = cfg.get<ModelEntry[]>('ollama.models', []) || [];
+    const defaultModel = cfg.get<string>('ollama.model', 'Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf');
+    const items: Array<{ label: string; detail?: string; entry: ModelEntry | null }> = [
+      { label: 'Default', detail: defaultModel, entry: null }
+    ];
+    for (const m of extras) items.push({ label: m.label, detail: m.model + (m.host ? ` @ ${m.host}` : ''), entry: m });
+    if (items.length === 1) {
+      this.post({ type: 'info', text: 'No extra models configured. Add entries to vdsx.ollama.models in settings.json.' });
+      return;
+    }
+    const pick = await vscode.window.showQuickPick(items, { placeHolder: 'Choose model for subsequent calls' });
+    if (!pick) return;
+    this.modelOverride = pick.entry;
+    const label = pick.entry ? pick.label : '';
+    this.panel.webview.postMessage({ type: 'modelChanged', label });
+    this.post({ type: 'info', text: `Model: ${pick.label}` });
+  }
+
+  private toggleThinking() {
+    this.thinking = !this.thinking;
+    this.panel.webview.postMessage({ type: 'thinkingChanged', value: this.thinking });
+    this.post({ type: 'info', text: `Thinking: ${this.thinking ? 'on' : 'off'}` });
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Output language — post-response translation (A7)
+  // ───────────────────────────────────────────────────────────────────────
+
+  private async translateSummary(text: string): Promise<string> {
+    if (this.outputLang === 'en' || !text.trim()) return text;
+    const cfg = this.buildLlmConfig();
+    if (!cfg) return text;
+    this.post({ type: 'info', text: `Translating to ${LANG_NAMES[this.outputLang]}...` });
+    const prompt = `Translate the following summary to ${LANG_NAMES[this.outputLang]}. Keep code blocks, file paths, command names, and technical terms UNCHANGED. Return ONLY the translation, no preamble, no explanation.\n\n---\n${text}`;
+    try {
+      const resp = await chat({ ...cfg, temperature: 0.1 }, [{ role: 'user', content: prompt }], []);
+      return resp.content || text;
+    } catch (e) {
+      this.post({ type: 'error', text: `Translation failed: ${e instanceof Error ? e.message : 'unknown'}` });
+      return text;
+    }
+  }
+
+  private async maybeTranslateLastAssistant(): Promise<void> {
+    if (this.outputLang === 'en') return;
+    const last = [...this.history].reverse().find((m) => m.role === 'assistant' && m.content && m.content.trim());
+    if (!last?.content) return;
+    const translated = await this.translateSummary(last.content);
+    if (translated && translated !== last.content) {
+      this.post({ type: 'assistant', text: `[${this.outputLang}] ${translated}` });
+    }
+  }
+
+  // ───────────────────────────────────────────────────────────────────────
+  // Slash command implementations (A8)
+  // ───────────────────────────────────────────────────────────────────────
+
+  private async cmdTranslate(_extraText: string): Promise<void> {
+    if (this.attachments.length === 0) {
+      this.post({ type: 'error', text: 'No files attached. Use + → Add file to attach first.' });
+      return;
+    }
+    const llmCfg = this.buildLlmConfig();
+    if (!llmCfg) return;
+    const probeErr = await probe(llmCfg);
+    if (probeErr) { this.post({ type: 'error', text: probeErr }); return; }
+
+    const targetLang = this.outputLang === 'en' ? 'Vietnamese' : LANG_NAMES[this.outputLang];
+    if (this.outputLang === 'en') {
+      this.post({ type: 'info', text: 'Output language is English — translating to Vietnamese by default. Change via Output language.' });
+    }
+
+    this.panel.webview.postMessage({ type: 'running', value: true });
+    this.post({ type: 'user', text: `/translate (${this.attachments.length} file${this.attachments.length === 1 ? '' : 's'})` });
+
+    try {
+      for (const a of this.attachments) {
+        if (this.stopFlag) break;
+        if (a.type !== 'file') { this.post({ type: 'info', text: `Skipping folder: ${this.toRel(a.path)}` }); continue; }
+        let content: string;
+        try { content = fs.readFileSync(a.path, 'utf8'); }
+        catch (e) { this.post({ type: 'error', text: `Read failed ${this.toRel(a.path)}: ${e instanceof Error ? e.message : 'unknown'}` }); continue; }
+        this.post({ type: 'info', text: `Translating ${this.toRel(a.path)} → ${targetLang}...` });
+        const prompt = `Translate the content below to ${targetLang}. Preserve code fences, identifiers, file paths, and technical terms unchanged. Return ONLY the translated content.\n\n${content}`;
+        const resp = await chat({ ...llmCfg, temperature: 0.2 }, [{ role: 'user', content: prompt }], []);
+        this.post({ type: 'assistant', text: `### ${this.toRel(a.path)} (${targetLang})\n\n${resp.content || '(empty)'}` });
+      }
+      this.clearAttachments();
+    } catch (e) {
+      this.post({ type: 'error', text: e instanceof Error ? e.message : String(e) });
+    } finally {
+      this.panel.webview.postMessage({ type: 'running', value: false });
+    }
+  }
+
+  private async cmdDiffReview(extraText: string): Promise<void> {
+    const llmCfg = this.buildLlmConfig();
+    if (!llmCfg) return;
+    const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!ws) { this.post({ type: 'error', text: 'Open a workspace folder first.' }); return; }
+
+    this.panel.webview.postMessage({ type: 'running', value: true });
+    this.post({ type: 'user', text: `/diffreview${extraText ? ' ' + extraText : ''}` });
+
+    try {
+      if (!(await isGitRepo(ws))) { this.post({ type: 'error', text: 'Not a git repository.' }); return; }
+      this.post({ type: 'info', text: 'Running git diff...' });
+      const diff = await runGitDiff(ws);
+      if (!diff.trim()) { this.post({ type: 'info', text: 'No changes in working tree.' }); return; }
+      const diffPath = await saveDiffToVdsx(ws, diff, 'review');
+      this.post({ type: 'info', text: `Diff saved: ${diffPath}` });
+
+      const attachContent = this.readAttachmentsAsBlock();
+      const hasRequirement = Boolean(extraText.trim() || attachContent);
+      let prompt: string;
+      if (!hasRequirement) {
+        prompt = `Summarize the following git diff. List: files changed, high-level intent per change, risks.\n\n\`\`\`diff\n${diff.slice(0, 60000)}\n\`\`\``;
+      } else {
+        const req = [extraText.trim(), attachContent].filter(Boolean).join('\n\n');
+        prompt = `Given the REQUIREMENT below, analyze whether the DIFF implements it. List: (1) what's covered, (2) gaps/missing, (3) potential issues.\n\nREQUIREMENT:\n${req}\n\nDIFF:\n\`\`\`diff\n${diff.slice(0, 60000)}\n\`\`\``;
+      }
+      const resp = await chat({ ...llmCfg, temperature: 0.2 }, [{ role: 'user', content: prompt }], []);
+      this.post({ type: 'assistant', text: resp.content || '(empty)' });
+      this.history.push({ role: 'user', content: prompt });
+      this.history.push(resp);
+      this.clearAttachments();
+      await this.maybeTranslateLastAssistant();
+    } catch (e) {
+      this.post({ type: 'error', text: e instanceof Error ? e.message : String(e) });
+    } finally {
+      this.panel.webview.postMessage({ type: 'running', value: false });
+    }
+  }
+
+  private async cmdFixBug(extraText: string): Promise<void> {
+    const llmCfg = this.buildLlmConfig();
+    if (!llmCfg) return;
+    const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!ws) { this.post({ type: 'error', text: 'Open a workspace folder first.' }); return; }
+
+    const hasGuidance = Boolean(extraText.trim() || this.attachments.length > 0);
+
+    this.panel.webview.postMessage({ type: 'running', value: true });
+    this.post({ type: 'user', text: `/fixbug${extraText ? ' ' + extraText : ''}${this.attachments.length ? ` (+${this.attachments.length} attachments)` : ''}` });
+
+    try {
+      if (!hasGuidance) {
+        // Sequential project-wide review, cap 20 files
+        this.post({ type: 'info', text: 'No guidance — scanning project root for review (cap 20 files)...' });
+        const files = this.collectProjectFiles(ws, 20);
+        if (files.length === 0) { this.post({ type: 'info', text: 'No reviewable files found.' }); return; }
+        for (const f of files) {
+          if (this.stopFlag) break;
+          let content: string;
+          try { content = fs.readFileSync(f, 'utf8').slice(0, 6000); }
+          catch { continue; }
+          const rel = this.toRel(f);
+          this.post({ type: 'info', text: `Reviewing ${rel}...` });
+          const prompt = `Review this file for bugs, security issues, and code smells. Be specific: cite line numbers or snippets. If clean, say so.\n\n## ${rel}\n\`\`\`\n${content}\n\`\`\``;
+          const resp = await chat({ ...llmCfg, temperature: 0.2 }, [{ role: 'user', content: prompt }], []);
+          this.post({ type: 'assistant', text: `### ${rel}\n\n${resp.content || '(no issues found)'}` });
+        }
+        this.post({ type: 'info', text: 'Review complete.' });
+      } else {
+        // Targeted review with attachments + input text → suggest fixes (no auto-edit)
+        const attachContent = this.readAttachmentsAsBlock();
+        const prompt = `Review the attached code for bugs. PROPOSE fixes as unified diffs or code snippets. Do NOT describe, just show the fix. User will apply manually.\n\nGUIDANCE:\n${extraText || '(review attachments holistically)'}\n\n${attachContent}`;
+        this.post({ type: 'info', text: 'Analyzing...' });
+        const resp = await chat({ ...llmCfg, temperature: 0.2 }, [{ role: 'user', content: prompt }], []);
+        this.post({ type: 'assistant', text: resp.content || '(empty)' });
+        this.history.push({ role: 'user', content: prompt });
+        this.history.push(resp);
+        this.clearAttachments();
+        await this.maybeTranslateLastAssistant();
+      }
+    } catch (e) {
+      this.post({ type: 'error', text: e instanceof Error ? e.message : String(e) });
+    } finally {
+      this.panel.webview.postMessage({ type: 'running', value: false });
+    }
+  }
+
+  private collectProjectFiles(root: string, cap: number): string[] {
+    const IGNORE = new Set(['node_modules', '.git', 'dist', 'build', '.next', '.turbo', '.vdsx', '.vscode-test']);
+    const exts = new Set(['.ts', '.tsx', '.js', '.jsx', '.py', '.go', '.rs', '.java', '.json', '.yaml', '.yml']);
+    const out: string[] = [];
+    const walk = (dir: string) => {
+      if (out.length >= cap) return;
+      let entries: fs.Dirent[];
+      try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+      for (const e of entries) {
+        if (out.length >= cap) return;
+        if (IGNORE.has(e.name)) continue;
+        const full = path.join(dir, e.name);
+        if (e.isDirectory()) walk(full);
+        else if (e.isFile() && exts.has(path.extname(e.name))) out.push(full);
+      }
+    };
+    walk(root);
+    return out.slice(0, cap);
+  }
+
+  private async cmdPts(extraText: string): Promise<void> { await this.cmdTestGen('pts', extraText); }
+  private async cmdIts(extraText: string): Promise<void> { await this.cmdTestGen('its', extraText); }
+
+  private async cmdTestGen(kind: 'pts' | 'its', extraText: string): Promise<void> {
+    const llmCfg = this.buildLlmConfig();
+    if (!llmCfg) return;
+    const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath;
+    if (!ws) { this.post({ type: 'error', text: 'Open a workspace folder first.' }); return; }
+
+    this.panel.webview.postMessage({ type: 'running', value: true });
+    this.post({ type: 'user', text: `/${kind}${extraText ? ' ' + extraText : ''}${this.attachments.length ? ` (+${this.attachments.length} attachments)` : ''}` });
+
+    try {
+      const diff = (await isGitRepo(ws)) ? await runGitDiff(ws) : '';
+      const attachContent = this.readAttachmentsAsBlock();
+      const kindLabel = kind === 'pts' ? 'unit tests (happy path + edge cases + error paths)' : 'UAT / end-to-end test scenarios (Gherkin Given/When/Then or numbered manual test steps)';
+      const ext = kind === 'pts' ? 'test.md' : 'uat.md';
+
+      const planPrompt = `You will generate ${kindLabel}. First propose 1-5 test files with path suggestions (inside .vdsx/tests/) and a one-line purpose each. Output ONLY JSON: {"tests":[{"filename":"...","purpose":"..."}]}.\n\nDIFF:\n\`\`\`diff\n${diff.slice(0, 30000) || '(no diff)'}\n\`\`\`\n\n${attachContent}\n\nREQUIREMENTS/CONTEXT:\n${extraText || '(none)'}`;
+      this.post({ type: 'info', text: 'Planning test files...' });
+      const planResp = await chat({ ...llmCfg, temperature: 0.1 }, [{ role: 'user', content: planPrompt }], []);
+      type PlannedTest = { filename: string; purpose: string };
+      let plan: { tests: PlannedTest[] };
+      try {
+        const txt = (planResp.content || '').trim();
+        const match = /\{[\s\S]*\}/.exec(txt);
+        plan = match ? JSON.parse(match[0]) : { tests: [] };
+      } catch {
+        plan = { tests: [] };
+      }
+      if (!plan.tests || plan.tests.length === 0) {
+        plan = { tests: [{ filename: `${kind}-${timestamp()}.${ext}`, purpose: 'Generated tests' }] };
+      }
+
+      ensureVdsxDir(ws, 'tests');
+      for (const t of plan.tests) {
+        if (this.stopFlag) break;
+        const safeName = t.filename.replace(/[^a-zA-Z0-9._-]/g, '_');
+        const rel = `.vdsx/tests/${safeName}`;
+        const abs = path.join(ws, rel);
+        const exists = fs.existsSync(abs);
+        if (exists) this.post({ type: 'info', text: `⚠ Overwriting: ${rel}` });
+        this.post({ type: 'info', text: `Generating ${rel} — ${t.purpose}...` });
+        const genPrompt = kind === 'pts'
+          ? `Write unit tests for: ${t.purpose}.\nCover happy path, edge cases, error paths. Include setup/teardown if needed.\nDetect test framework from DIFF/attachments or default to Jest.\nOutput ONLY code — no preamble, no explanation.\n\nDIFF:\n\`\`\`diff\n${diff.slice(0, 30000) || '(no diff)'}\n\`\`\`\n\n${attachContent}\n\nCONTEXT:\n${extraText || '(none)'}`
+          : `Write UAT/e2e test scenarios for: ${t.purpose}.\nFormat: Gherkin (Given/When/Then) OR numbered manual test steps.\nCover happy path, error states, edge UI states, accessibility concerns.\nOutput ONLY scenarios.\n\nDIFF:\n\`\`\`diff\n${diff.slice(0, 30000) || '(no diff)'}\n\`\`\`\n\n${attachContent}\n\nCONTEXT:\n${extraText || '(none)'}`;
+        const gen = await chat({ ...llmCfg, temperature: 0.2 }, [{ role: 'user', content: genPrompt }], []);
+        const body = (gen.content || '').replace(/^```[a-zA-Z]*\n?/, '').replace(/```\s*$/, '');
+        fs.writeFileSync(abs, body, 'utf8');
+        this.post({ type: 'assistant', text: `Saved: ${rel}\n\n${body.slice(0, 1500)}${body.length > 1500 ? '\n[...]' : ''}` });
+      }
+      this.clearAttachments();
+    } catch (e) {
+      this.post({ type: 'error', text: e instanceof Error ? e.message : String(e) });
+    } finally {
+      this.panel.webview.postMessage({ type: 'running', value: false });
+    }
+  }
+
   private buildLlmConfig(): LlmConfig | null {
     const cfg = vscode.workspace.getConfiguration('vdsx');
-    const apiKey = cfg.get<string>('ollama.apiKey', '');
+    const baseApiKey = cfg.get<string>('ollama.apiKey', '');
+    const baseHost = cfg.get<string>('ollama.host', 'http://192.168.1.220:11434');
+    const baseModel = cfg.get<string>('ollama.model', 'Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf');
+
+    const override = this.modelOverride;
+    const host = override?.host ?? baseHost;
+    const model = override?.model ?? baseModel;
+    const apiKey = override?.apiKey ?? baseApiKey;
+
     if (!apiKey) {
       this.post({ type: 'error', text: 'vdsx.ollama.apiKey is not set. Add it to VSCode settings.' });
       return null;
     }
     return {
-      host: cfg.get<string>('ollama.host', 'http://192.168.1.220:11434'),
-      model: cfg.get<string>('ollama.model', 'Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf'),
+      host,
+      model,
       apiKey,
       numCtx: cfg.get<number>('ollama.numCtx', 49152),
       temperature: cfg.get<number>('ollama.temperature', 0.2),
@@ -195,6 +699,7 @@ export class ChatPanel {
     if (probeErr) { this.post({ type: 'error', text: probeErr }); return; }
 
     this.post({ type: 'user', text: `/do ${goal}` });
+    this.panel.webview.postMessage({ type: 'running', value: true });
 
     // All tools auto-approved during a /do run — user approves the PLAN, not each edit.
     const ctx: ToolContext = {
@@ -243,12 +748,22 @@ export class ChatPanel {
             );
             return pick === 'Approve';
           },
-          onReport: (md) => this.post({ type: 'assistant', text: md }),
+          onReport: async (md) => {
+            this.post({ type: 'assistant', text: md });
+            if (this.outputLang !== 'en') {
+              const translated = await this.translateSummary(md);
+              if (translated && translated !== md) {
+                this.post({ type: 'assistant', text: `[${this.outputLang}] ${translated}` });
+              }
+            }
+          },
           shouldStop: () => this.stopFlag
         }
       );
     } catch (e) {
       this.post({ type: 'error', text: e instanceof Error ? e.message : String(e) });
+    } finally {
+      this.panel.webview.postMessage({ type: 'running', value: false });
     }
   }
 
@@ -277,20 +792,27 @@ export class ChatPanel {
     if (this.history.length === 0) {
       this.history.push({ role: 'system', content: system });
     }
-    this.history.push({ role: 'user', content: userText });
-    this.post({ type: 'user', text: userText });
+    const attachBlock = this.readAttachmentsAsBlock();
+    const userMsgContent = attachBlock ? `${attachBlock}\n\n${userText}` : userText;
+    this.history.push({ role: 'user', content: userMsgContent });
+    this.post({ type: 'user', text: userText + (this.attachments.length ? ` (+${this.attachments.length} attachment${this.attachments.length === 1 ? '' : 's'})` : '') });
+    this.clearAttachments();
 
     // Phase-0 instrumentation
     const preBudget = breakdownMessages(this.history);
     this.post({ type: 'info', text: 'pre-call ' + formatBreakdown(preBudget, 0, llmCfg.numCtx) });
 
+    this.panel.webview.postMessage({ type: 'running', value: true });
     try {
       if (this.stopFlag) return;
       const reply = await chat(llmCfg, this.history, []);
       this.history.push(reply);
       if (reply.content) this.post({ type: 'assistant', text: reply.content });
+      await this.maybeTranslateLastAssistant();
     } catch (e) {
       this.post({ type: 'error', text: e instanceof Error ? e.message : String(e) });
+    } finally {
+      this.panel.webview.postMessage({ type: 'running', value: false });
     }
 
     const postBudget = breakdownMessages(this.history);
@@ -308,7 +830,7 @@ export class ChatPanel {
 
     const ws = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? process.cwd();
     const maxIter = cfg.get<number>('maxIterations', 20);
-    const autoApprove = new Set(cfg.get<string[]>('autoApprove', ['read_file', 'grep', 'glob']));
+    const autoApprove = this.effectiveAutoApprove();
 
     // Build system prompt
     const agent = this.currentAgent;
@@ -324,13 +846,19 @@ export class ChatPanel {
           ].join('\n')
     ];
     if (contextFiles) systemParts.push('---\n# Workspace context\n\n' + contextFiles);
+    if (this.thinking) systemParts.push('Think step-by-step inside <thinking>...</thinking> blocks before tool calls or final answer. Keep thinking blocks internal — focus final answer outside thinking.');
+    if (this.outputLang !== 'en') systemParts.push(`Work internally in English. Tool calls, code, file paths MUST stay in English. User-facing summaries will be translated to ${LANG_NAMES[this.outputLang]} separately.`);
+    if (this.permMode === 'plan') systemParts.push('PLAN MODE: you MUST NOT call write_file, edit_file, or bash. Only read_file, grep, glob are allowed. Produce a written plan instead.');
     const system = systemParts.join('\n\n');
 
     if (this.history.length === 0) {
       this.history.push({ role: 'system', content: system });
     }
-    this.history.push({ role: 'user', content: userText });
-    this.post({ type: 'user', text: userText });
+    const attachBlock = this.readAttachmentsAsBlock();
+    const userMsgContent = attachBlock ? `${attachBlock}\n\n${userText}` : userText;
+    this.history.push({ role: 'user', content: userMsgContent });
+    this.post({ type: 'user', text: userText + (this.attachments.length ? ` (+${this.attachments.length} attachment${this.attachments.length === 1 ? '' : 's'})` : '') });
+    this.clearAttachments();
 
     const ctx: ToolContext = {
       workspaceRoot: ws,
@@ -345,6 +873,7 @@ export class ChatPanel {
     const preBudget = breakdownMessages(this.history);
     this.post({ type: 'info', text: 'pre-call ' + formatBreakdown(preBudget, schemaTokens, llmCfg.numCtx) });
 
+    this.panel.webview.postMessage({ type: 'running', value: true });
     try {
       await runAgent(this.history, {
         cfg: llmCfg,
@@ -363,8 +892,11 @@ export class ChatPanel {
         },
         shouldStop: () => this.stopFlag
       });
+      await this.maybeTranslateLastAssistant();
     } catch (e) {
       this.post({ type: 'error', text: e instanceof Error ? e.message : String(e) });
+    } finally {
+      this.panel.webview.postMessage({ type: 'running', value: false });
     }
 
     // Phase-0 instrumentation: log final history size after tool results + assistant responses
@@ -374,6 +906,15 @@ export class ChatPanel {
   }
 
   private async askApproval(tool: string, args: Record<string, unknown>): Promise<boolean> {
+    // Plan mode: hard deny write/edit/bash regardless of approval
+    if (this.permMode === 'plan' && (tool === 'write_file' || tool === 'edit_file' || tool === 'bash')) {
+      this.post({ type: 'info', text: `[plan mode] denied ${tool} — switch permission mode to apply changes.` });
+      return false;
+    }
+    // Bypass: allow all without prompt
+    if (this.permMode === 'bypass') return true;
+    // Auto: non-bash auto-approved (already in autoApprove set); bash falls through to prompt
+    // Ask / auto-edit: prompt
     const summary = JSON.stringify(args).slice(0, 200);
     const pick = await vscode.window.showWarningMessage(
       `VDS-X wants to run ${tool}(${summary})`,
@@ -511,6 +1052,30 @@ export class ChatPanel {
     font-size: 13px;
     width: 100%;
   }
+  #attachmentBar {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    padding: 6px 8px 0;
+  }
+  #attachmentBar:empty { padding: 0; }
+  .attach-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    background: var(--vscode-badge-background);
+    color: var(--vscode-badge-foreground);
+    padding: 2px 6px 2px 8px;
+    border-radius: 10px;
+    font-size: 11px;
+    font-family: var(--vscode-editor-font-family);
+  }
+  .attach-chip .close {
+    cursor: pointer;
+    padding: 0 2px;
+    opacity: 0.7;
+  }
+  .attach-chip .close:hover { opacity: 1; }
   #composerFooter {
     display: flex;
     align-items: center;
@@ -556,9 +1121,15 @@ export class ChatPanel {
     font-size: 14px;
     line-height: 1;
     font-weight: 600;
+    min-width: 32px;
   }
   #sendBtn:hover { background: var(--vscode-button-hoverBackground); }
   #sendBtn:disabled { opacity: 0.4; cursor: not-allowed; }
+  #sendBtn.stop {
+    background: var(--vscode-errorForeground, #e57373);
+    color: var(--vscode-editor-background);
+  }
+  #sendBtn.stop:hover { opacity: 0.85; }
 
   /* Popup menu */
   .popup {
@@ -619,6 +1190,7 @@ export class ChatPanel {
 
   <div id="composer">
     <div id="composerBox">
+      <div id="attachmentBar"></div>
       <textarea id="input" placeholder="Ask or instruct... (Ctrl+Enter to send)"></textarea>
       <div id="composerFooter">
         <button class="footer-btn" id="plusBtn" title="Add context">+</button>
@@ -626,37 +1198,46 @@ export class ChatPanel {
         <span id="agentChip" style="display:none"></span>
         <div class="footer-spacer"></div>
         <span id="modeChip" title="Click to switch">Workflow</span>
-        <button class="footer-btn" id="stopBtn" title="Stop generation">◼</button>
-        <button id="sendBtn" title="Send (Ctrl+Enter)">↑</button>
+        <span id="modePermission" title="Permission mode">Ask before edits</span>
+        <button id="sendBtn" class="send" title="Send (Ctrl+Enter)">↑</button>
       </div>
     </div>
   </div>
 
   <!-- Actions menu (⋯ in title bar) -->
   <div class="popup" id="actionsMenu">
-    <div class="section">CONTEXT</div>
-    <div class="item" data-action="clear">🗑️ Clear conversation</div>
-    <div class="item" data-action="reload">⟳ Reload ECC</div>
+    <div class="section">Context</div>
+    <div class="item" data-action="clear">Clear conversation</div>
+    <div class="item" data-action="reload">Reload ECC</div>
   </div>
 
   <!-- + menu (composer) -->
   <div class="popup" id="plusMenu">
-    <div class="section">ADD CONTEXT</div>
-    <div class="item" data-action="clear">🗑️ Clear conversation</div>
-    <div class="item" data-action="reload">⟳ Reload ECC definitions</div>
+    <div class="section">Input</div>
+    <div class="item" data-action="addfile">Add file</div>
+    <div class="item" data-action="addfolder">Add folder</div>
   </div>
 
   <!-- / menu (composer) -->
   <div class="popup" id="slashMenu">
-    <div class="section">MODES</div>
-    <div class="item" data-mode="chat">💬 Chat <span class="desc">pure conversation</span></div>
-    <div class="item" data-mode="workflow">⚡ Workflow <span class="desc">tools + /do</span></div>
+    <div class="section">Agent Modes</div>
+    <div class="item" data-mode="chat">Chat only <span class="desc">pure conversation</span></div>
+    <div class="item" data-mode="workflow">Workflow <span class="desc">tools + agent loop</span></div>
     <div class="divider"></div>
-    <div class="section">AGENT</div>
+    <div class="section">Agents</div>
     <div id="agentList"></div>
     <div class="divider"></div>
-    <div class="section">COMMANDS</div>
-    <div class="item" data-insert="/do ">/do &lt;goal&gt; <span class="desc">orchestrator</span></div>
+    <div class="section">Settings</div>
+    <div class="item" data-action="switch-model">Switch model <span class="desc" id="modelDesc"></span></div>
+    <div class="item" data-action="toggle-thinking">Thinking <span class="desc" id="thinkingDesc">off</span></div>
+    <div class="item" data-action="switch-language">Output language <span class="desc" id="langDesc">en</span></div>
+    <div class="divider"></div>
+    <div class="section">Slash Commands</div>
+    <div class="item" data-insert="/translate">/translate <span class="desc">translate attached files</span></div>
+    <div class="item" data-insert="/diffreview">/diffreview <span class="desc">analyze git diff</span></div>
+    <div class="item" data-insert="/fixbug">/fixbug <span class="desc">review &amp; fix bugs</span></div>
+    <div class="item" data-insert="/pts ">/pts <span class="desc">generate unit tests</span></div>
+    <div class="item" data-insert="/its ">/its <span class="desc">generate UAT tests</span></div>
     <div class="item" data-insert="/help">/help <span class="desc">list options</span></div>
   </div>
 
@@ -670,6 +1251,14 @@ export class ChatPanel {
 
   let currentMode = 'workflow';
   let currentAgent = '';
+  let running = false;
+  const sendBtn = document.getElementById('sendBtn');
+
+  function setRunning(r) {
+    running = r;
+    if (r) { sendBtn.classList.add('stop'); sendBtn.textContent = '◼'; sendBtn.title = 'Stop generation'; }
+    else { sendBtn.classList.remove('stop'); sendBtn.textContent = '↑'; sendBtn.title = 'Send (Ctrl+Enter)'; }
+  }
 
   function add(cls, label, text) {
     const d = document.createElement('div');
@@ -693,6 +1282,27 @@ export class ChatPanel {
     });
     modeChip.textContent = mode === 'chat' ? 'Chat' : 'Workflow';
     currentMode = mode;
+  }
+
+  function renderAttachments(items) {
+    const bar = document.getElementById('attachmentBar');
+    if (!bar) return;
+    bar.innerHTML = '';
+    items.forEach((it, i) => {
+      const chip = document.createElement('span');
+      chip.className = 'attach-chip';
+      const label = document.createElement('span');
+      const basename = (it.path || '').split(/[/\\\\]/).pop();
+      label.textContent = (it.type === 'folder' ? '📁 ' : '') + (basename || it.path);
+      label.title = it.path;
+      chip.appendChild(label);
+      const x = document.createElement('span');
+      x.className = 'close';
+      x.textContent = '×';
+      x.addEventListener('click', (e) => { e.stopPropagation(); vscode.postMessage({ type: 'removeAttachment', value: String(i) }); });
+      chip.appendChild(x);
+      bar.appendChild(chip);
+    });
   }
 
   function refreshAgentList(agents) {
@@ -741,6 +1351,26 @@ export class ChatPanel {
       window.__lastAgents = m.agents;
       refreshAgentList(m.agents);
     }
+    else if (m.type === 'running') { setRunning(Boolean(m.value)); }
+    else if (m.type === 'permModeChanged') {
+      const el = document.getElementById('modePermission');
+      if (el) el.textContent = m.label || 'Ask before edits';
+    }
+    else if (m.type === 'languageChanged') {
+      const el = document.getElementById('langDesc');
+      if (el) el.textContent = m.value || 'en';
+    }
+    else if (m.type === 'thinkingChanged') {
+      const el = document.getElementById('thinkingDesc');
+      if (el) el.textContent = m.value ? 'on' : 'off';
+    }
+    else if (m.type === 'modelChanged') {
+      const el = document.getElementById('modelDesc');
+      if (el) el.textContent = m.label || '';
+    }
+    else if (m.type === 'attachments') {
+      renderAttachments(m.items || []);
+    }
   });
 
   // Tabs — click to switch mode
@@ -778,6 +1408,8 @@ export class ChatPanel {
   document.getElementById('slashBtn').addEventListener('click', (e) => { e.stopPropagation(); toggle(popups.slash, e.currentTarget, true); });
   document.getElementById('actionsBtn').addEventListener('click', (e) => { e.stopPropagation(); toggle(popups.actions, e.currentTarget, false); });
   modeChip.addEventListener('click', (e) => { e.stopPropagation(); toggle(popups.slash, e.currentTarget, true); });
+  const modePermEl = document.getElementById('modePermission');
+  if (modePermEl) modePermEl.addEventListener('click', (e) => { e.stopPropagation(); vscode.postMessage({ type: 'openPermPicker' }); });
   document.addEventListener('click', hideAll);
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape') hideAll(); });
 
@@ -793,6 +1425,15 @@ export class ChatPanel {
       const insert = item.getAttribute('data-insert');
       if (action === 'clear') vscode.postMessage({ type: 'clearHistory' });
       else if (action === 'reload') vscode.postMessage({ type: 'reloadEcc' });
+      else if (action === 'addfile') vscode.postMessage({ type: 'addActiveFile' });
+      else if (action === 'addfolder') vscode.postMessage({ type: 'addActiveFolder' });
+      else if (action === 'switch-model') vscode.postMessage({ type: 'openModelPicker' });
+      else if (action === 'toggle-thinking') vscode.postMessage({ type: 'toggleThinking' });
+      else if (action === 'switch-language') vscode.postMessage({ type: 'openLanguagePicker' });
+      else if (action === 'switch-perm') vscode.postMessage({ type: 'openPermPicker' });
+      else if (action === 'setperm') vscode.postMessage({ type: 'setPermMode', value: item.getAttribute('data-perm') });
+      else if (action === 'setlang') vscode.postMessage({ type: 'setLanguage', value: item.getAttribute('data-lang') });
+      else if (action === 'removeAttach') vscode.postMessage({ type: 'removeAttachment', value: item.getAttribute('data-idx') });
       else if (mode) {
         if (mode !== currentMode) { setActiveTab(mode); vscode.postMessage({ type: 'setMode', mode }); }
       }
@@ -804,10 +1445,12 @@ export class ChatPanel {
     });
   });
 
-  document.getElementById('sendBtn').addEventListener('click', send);
-  document.getElementById('stopBtn').addEventListener('click', () => vscode.postMessage({ type: 'stop' }));
+  sendBtn.addEventListener('click', () => {
+    if (running) { vscode.postMessage({ type: 'stop' }); }
+    else { send(); }
+  });
   input.addEventListener('keydown', (e) => {
-    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send(); }
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); if (!running) send(); }
   });
   // Auto-grow textarea
   input.addEventListener('input', () => {

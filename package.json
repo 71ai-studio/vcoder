@@ -109,6 +109,50 @@
           ],
           "default": "auto-clear",
           "description": "How conversation history behaves when you switch between Chat and Workflow modes."
+        },
+        "vdsx.defaultPermissionMode": {
+          "type": "string",
+          "enum": ["ask", "auto-edit", "plan", "auto", "bypass"],
+          "enumDescriptions": [
+            "Show approval modal for every risky tool call (safest).",
+            "Auto-approve edit_file and write_file; still ask for bash.",
+            "Read-only: deny write/edit/bash outright. Great for exploring.",
+            "Auto-approve all non-bash tools; still ask for bash.",
+            "Auto-approve every tool including bash (DANGEROUS)."
+          ],
+          "default": "ask",
+          "description": "Default permission mode for Workflow agent tool calls."
+        },
+        "vdsx.outputLanguage": {
+          "type": "string",
+          "enum": ["en", "vi", "ja"],
+          "enumDescriptions": [
+            "English — no translation.",
+            "Vietnamese — translate final summaries to Vietnamese after LLM responds.",
+            "Japanese — translate final summaries to Japanese after LLM responds."
+          ],
+          "default": "en",
+          "description": "Language for user-facing summaries. LLM works internally in English; only final summary is translated."
+        },
+        "vdsx.ollama.models": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "properties": {
+              "label": { "type": "string" },
+              "model": { "type": "string" },
+              "host": { "type": "string" },
+              "apiKey": { "type": "string" }
+            },
+            "required": ["label", "model"]
+          },
+          "default": [],
+          "description": "Additional models to pick from (via Switch model menu). Each entry overrides ollama.model and optionally host/apiKey for the current session."
+        },
+        "vdsx.outputDir": {
+          "type": "string",
+          "default": ".vdsx",
+          "description": "Workspace-relative folder for agent-generated artifacts (diffs, tests, reports). Auto-added to .gitignore."
         }
       }
     }
