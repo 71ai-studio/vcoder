@@ -213,6 +213,53 @@ export interface StreamHooks {
   shouldAbort?: () => boolean;
 }
 
+const RETRY_ATTEMPTS = 3;
+const RETRY_BASE_DELAY_MS = 1000;
+
+function isTransientError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  // Network-level failures worth retrying
+  if (/ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up|fetch failed|network|aborted/i.test(msg)) return true;
+  // 5xx from server side
+  if (/HTTP 5\d{2}/.test(msg)) return true;
+  // 429 rate limit
+  if (/HTTP 429/.test(msg)) return true;
+  return false;
+}
+
+async function fetchWithRetry(
+  url: string,
+  init: RequestInit,
+  allowRetry: boolean,
+  onRetryInfo?: (attempt: number, err: unknown) => void
+): Promise<Response> {
+  let lastErr: unknown;
+  const attempts = allowRetry ? RETRY_ATTEMPTS : 1;
+  for (let i = 0; i < attempts; i++) {
+    try {
+      const res = await fetch(url, init);
+      if (!res.ok) {
+        const txt = await res.text();
+        const err = new Error(`LLM HTTP ${res.status}: ${txt.slice(0, 500)}`);
+        if (allowRetry && i < attempts - 1 && isTransientError(err)) {
+          lastErr = err;
+          onRetryInfo?.(i + 1, err);
+          await new Promise((r) => setTimeout(r, RETRY_BASE_DELAY_MS * Math.pow(2, i)));
+          continue;
+        }
+        throw err;
+      }
+      return res;
+    } catch (e) {
+      lastErr = e;
+      if (!allowRetry || i >= attempts - 1 || !isTransientError(e)) throw e;
+      onRetryInfo?.(i + 1, e);
+      await new Promise((r) => setTimeout(r, RETRY_BASE_DELAY_MS * Math.pow(2, i)));
+    }
+  }
+  throw lastErr ?? new Error('LLM: unreachable');
+}
+
 export async function chat(
   cfg: LlmConfig,
   messages: ChatMessage[],
@@ -230,19 +277,25 @@ export async function chat(
   };
   if (tools && tools.length > 0) body.tools = tools;
 
-  const res = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${cfg.apiKey}`
+  // Streaming: can retry only the initial fetch (before any chunks delivered). We detect this
+  // because once the SSE parser loop runs, partial output has already been handed to caller.
+  const res = await fetchWithRetry(
+    url,
+    {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${cfg.apiKey}`
+      },
+      body: JSON.stringify(body)
     },
-    body: JSON.stringify(body)
-  });
-
-  if (!res.ok) {
-    const txt = await res.text();
-    throw new Error(`LLM HTTP ${res.status}: ${txt.slice(0, 500)}`);
-  }
+    true,
+    (attempt, err) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      // Log to stderr for CLI visibility; webview shows nothing here — caller's onInfo could bridge.
+      console.error(`[ollama] retry ${attempt}/${RETRY_ATTEMPTS - 1} after: ${msg.slice(0, 200)}`);
+    }
+  );
 
   if (!streaming) {
     const data = (await res.json()) as Record<string, unknown>;

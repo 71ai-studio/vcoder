@@ -61,8 +61,28 @@ async function main() {
   let stopped = false;
   process.on('SIGINT', () => { stopped = true; console.error('\n[SIGINT]'); });
 
+  let currentStreamPhase: string | null = null;
   await orchestrate(
-    { cfg, goal, ctx, maxFixAttempts: 3, phaseAgents, contextFiles },
+    {
+      cfg,
+      goal,
+      ctx,
+      maxFixAttempts: 3,
+      phaseAgents,
+      contextFiles,
+      onStreamStart: (phase) => {
+        currentStreamPhase = phase;
+        process.stdout.write(`\n╭─ stream [${phase}] ─╮\n`);
+      },
+      onStreamChunk: (_phase, delta) => {
+        process.stdout.write(delta);
+      },
+      onStreamEnd: (_phase, _text) => {
+        process.stdout.write(`\n╰─ end [${currentStreamPhase}] ─╯\n`);
+        currentStreamPhase = null;
+      },
+      shouldStop: () => stopped
+    },
     {
       onPhase: (phase, info) => console.log(`\n── ${phase} ── ${info ?? ''}`),
       onPlan: async (plan: Plan) => {

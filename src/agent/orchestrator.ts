@@ -93,7 +93,15 @@ function mkPhaseStream(opts: OrchestratorOptions, phase: string): PhaseStream | 
 // Phase 1 — READ: enrich the user goal (one-shot LLM call, no tools)
 // ───────────────────────────────────────────────────────────────────────────────
 async function phaseRead(cfg: LlmConfig, goal: string, contextFiles?: string, onLlmCall?: OrchestratorOptions['onLlmCall'], stream?: PhaseStream): Promise<string> {
-  const base = 'You are an engineering analyst. Given a user goal, produce a concise enriched spec (max 300 words) listing: (a) what files are likely involved, (b) constraints/edge cases, (c) how success is verified. No code. No JSON yet — just prose.';
+  const base = [
+    'You are an engineering analyst. Given a user goal, produce a concise enriched spec (max 300 words) listing:',
+    '(a) **primary language/framework** — explicit. Detect from the goal, any attached files, and any workspace context below. State it in plain words (e.g. "Python + Flask", "TypeScript + React/Vite", "Go").',
+    '(b) what files are likely involved (paths if known)',
+    '(c) constraints/edge cases (including EVERY nuance mentioned in the goal — streaming? auth? a specific library?)',
+    '(d) how success is verified (what test command or smoke test makes sense for THIS language)',
+    '',
+    'No code. No JSON yet — just prose. Do NOT translate the goal; if user wrote Vietnamese, keep concepts faithful to what they asked.'
+  ].join('\n');
   const msgs: ChatMessage[] = [
     { role: 'system', content: buildSystemPrompt(base, undefined, contextFiles) },
     { role: 'user', content: `Goal:\n${goal}` }
@@ -122,15 +130,24 @@ async function phasePlan(cfg: LlmConfig, enrichedSpec: string, agentBody?: strin
     'Prefer FEWER, LARGER tasks. Combine tasks that touch the same file. Ideal plan: 1-3 tasks total, 4 max.',
     'Do NOT create "write tests" tasks — test_command already exists to verify.',
     'Each task should be a complete deliverable (one file end-to-end is usually one task).',
+    'Respect EVERY explicit requirement from the spec (streaming, specific libraries, API endpoints). A task that produces a server without the requested streaming is a failed task.',
     '',
     'Exact schema:',
     JSON.stringify(schemaExample, null, 2),
     '',
     'Rules:',
-    '- test_command: the single shell command that verifies the whole goal. Prefer `npm test`, `npx jest`, or `npx tsc --noEmit`.',
+    '- test_command: the single shell command that verifies the goal. MUST match the project language detected in the spec:',
+    '    * Python → `pytest`, `python -m unittest discover`, or `python -m py_compile <main>.py` for smoke',
+    '    * Node/JS → `npm test`, `npx jest`',
+    '    * TypeScript → `npx tsc --noEmit` + test runner',
+    '    * Go → `go test ./...`',
+    '    * Rust → `cargo test`',
+    '    * Java → `mvn test` / `gradle test`',
+    '  For brand-new projects with no test infrastructure, use a smoke command that at least verifies syntax/imports (e.g. `python -c "import app; print(\'ok\')"` or `node --check app.js`).',
+    '  NEVER default to `npm test` for non-Node projects.',
     '- Each task id is unique (t1, t2, ...).',
     '- files: workspace-relative paths you intend to touch.',
-    '- acceptance: brief note on what this task delivers.',
+    '- acceptance: brief note on what this task delivers — include the explicit requirement (e.g. "streams tokens via NDJSON").',
     '',
     'Output the JSON object and nothing else — the schema above overrides any conflicting instruction from agent guidance.'
   ].join('\n');
@@ -292,17 +309,35 @@ async function phaseTest(
 // ───────────────────────────────────────────────────────────────────────────────
 // Phase 5 — FIX: summarize test failure into a hint for the next execute attempt
 // ───────────────────────────────────────────────────────────────────────────────
-async function phaseFix(cfg: LlmConfig, taskTitle: string, testOutput: string, agentBody?: string, contextFiles?: string, onLlmCall?: OrchestratorOptions['onLlmCall'], stream?: PhaseStream): Promise<string> {
-  const base = 'Summarize a failing test output into a concise hint (max 150 words) pointing at the root cause. List: (1) what failed, (2) probable file:line, (3) one concrete fix direction. No code.';
+export interface FixOutcome {
+  hint: string;
+  newTestCommand?: string; // if FIX decides the original test_command was wrong for this project
+}
+
+async function phaseFix(cfg: LlmConfig, taskTitle: string, currentTestCommand: string, testOutput: string, agentBody?: string, contextFiles?: string, onLlmCall?: OrchestratorOptions['onLlmCall'], stream?: PhaseStream): Promise<FixOutcome> {
+  const base = [
+    'Analyze a failing test output. Output format (strictly):',
+    'Line 1 (optional): `TEST_COMMAND: <better-command>` — ONLY if the current test command is clearly wrong for this project type (e.g. `npm test` on a Python project; `pytest` on a Java project; `jest` with no jest installed).',
+    'Remaining (max 150 words): concise hint listing (1) what failed, (2) probable file:line, (3) one concrete fix direction. No code.',
+    '',
+    'If the test command is fine and only the code needs changing, OMIT Line 1 entirely and write the hint directly.'
+  ].join('\n');
   const msgs: ChatMessage[] = [
     { role: 'system', content: buildSystemPrompt(base, agentBody, contextFiles) },
-    { role: 'user', content: `Task: ${taskTitle}\n\nTest output:\n${testOutput.slice(-4000)}` }
+    { role: 'user', content: `Task: ${taskTitle}\nCurrent test command: ${currentTestCommand}\n\nTest output:\n${testOutput.slice(-4000)}` }
   ];
   onLlmCall?.('FIX', msgs, []);
   stream?.onStart?.();
   const res = await chat(cfg, msgs, [], stream?.onChunk ? { onChunk: stream.onChunk, shouldAbort: stream.shouldAbort } : undefined);
   stream?.onEnd?.(res.content || '');
-  return res.content || '(fix phase returned no hint)';
+  const raw = res.content || '(fix phase returned no hint)';
+  const cmdMatch = /^\s*TEST_COMMAND:\s*(.+?)\s*$/m.exec(raw);
+  if (cmdMatch) {
+    const newCmd = cmdMatch[1].trim();
+    const hint = raw.replace(cmdMatch[0], '').trim();
+    return { hint: hint || '(no additional hint)', newTestCommand: newCmd };
+  }
+  return { hint: raw };
 }
 
 // ───────────────────────────────────────────────────────────────────────────────
@@ -404,7 +439,12 @@ export async function orchestrate(
   while (!testRes.passed && fixAttempts < maxFix && !cb.shouldStop()) {
     fixAttempts++;
     cb.onPhase('FIX', `analyzing failure (retry ${fixAttempts}/${maxFix})`);
-    const hint = await phaseFix(opts.cfg, plan.summary, testRes.output, pa.fix, ctxFiles, opts.onLlmCall, mkPhaseStream(opts, `FIX:${fixAttempts}`));
+    const fixOut = await phaseFix(opts.cfg, plan.summary, plan.test_command, testRes.output, pa.fix, ctxFiles, opts.onLlmCall, mkPhaseStream(opts, `FIX:${fixAttempts}`));
+    const hint = fixOut.hint;
+    if (fixOut.newTestCommand && fixOut.newTestCommand !== plan.test_command) {
+      cb.onPhase('FIX', `test_command updated: "${plan.test_command}" → "${fixOut.newTestCommand}"`);
+      plan.test_command = fixOut.newTestCommand;
+    }
     if (cb.shouldStop()) break;
 
     const allFiles = [...new Set(plan.tasks.flatMap((t) => t.files))];
