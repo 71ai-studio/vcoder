@@ -213,7 +213,7 @@ export async function chat(
   messages: ChatMessage[],
   tools: unknown[]
 ): Promise<ChatMessage> {
-  const url = cfg.host.replace(/\/$/, '') + '/v1/chat/completions';
+  const url = normalizeHost(cfg.host) + '/chat/completions';
   const body: Record<string, unknown> = {
     model: cfg.model,
     messages: messages.map((m, i) => toWire(m, `call_${i}`)),
@@ -243,8 +243,21 @@ export async function chat(
   return normalizeAssistant(msg);
 }
 
+/**
+ * Normalize a host URL so it always ends at /v1 (OpenAI-compat API base).
+ * Accepts:
+ *   "http://host:11434"        → "http://host:11434/v1"
+ *   "http://host:11434/"       → "http://host:11434/v1"
+ *   "http://host:11434/v1"     → "http://host:11434/v1"
+ *   "http://host:11434/v1/"    → "http://host:11434/v1"
+ */
+function normalizeHost(host: string): string {
+  const trimmed = host.replace(/\/+$/, '');
+  return /\/v1$/i.test(trimmed) ? trimmed : trimmed + '/v1';
+}
+
 export async function probe(cfg: LlmConfig): Promise<string | null> {
-  const url = cfg.host.replace(/\/$/, '') + '/v1/models';
+  const url = normalizeHost(cfg.host) + '/models';
   try {
     const res = await fetch(url, {
       headers: { Authorization: `Bearer ${cfg.apiKey}` }

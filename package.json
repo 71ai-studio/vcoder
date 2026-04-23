@@ -139,15 +139,46 @@
           "items": {
             "type": "object",
             "properties": {
-              "label": { "type": "string" },
-              "model": { "type": "string" },
-              "host": { "type": "string" },
-              "apiKey": { "type": "string" }
+              "label": { "type": "string", "description": "Display name in Switch model menu." },
+              "model": { "type": "string", "description": "Model id as returned by /v1/models." },
+              "host": { "type": "string", "description": "Base URL. Accepts with or without /v1 suffix." },
+              "apiKey": { "type": "string", "description": "Bearer token. Empty for local endpoints without auth." },
+              "numCtx": { "type": "number", "description": "Total context window (input + output tokens)." },
+              "temperature": { "type": "number" },
+              "maxOutput": { "type": "number", "description": "Max output tokens per response." }
             },
             "required": ["label", "model"]
           },
-          "default": [],
-          "description": "Additional models to pick from (via Switch model menu). Each entry overrides ollama.model and optionally host/apiKey for the current session."
+          "default": [
+            {
+              "label": "VDS public (Qwen2.5-Coder-14B)",
+              "model": "Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf",
+              "host": "http://qwen2514b.llama.4free.in/v1",
+              "apiKey": "llm-apikey-0101edfea867cd89a91b9afff0db018049c45349cc070be6",
+              "numCtx": 65536,
+              "temperature": 0.1,
+              "maxOutput": 8192
+            },
+            {
+              "label": "Local Ollama (qwen2.5-coder:7b)",
+              "model": "qwen2.5-coder:7b",
+              "host": "http://localhost:11434/v1",
+              "apiKey": "",
+              "numCtx": 32768,
+              "temperature": 0.1,
+              "maxOutput": 4096
+            },
+            {
+              "label": "Local llama-server (localhost:8080)",
+              "model": "local-model",
+              "host": "http://localhost:8080/v1",
+              "apiKey": "",
+              "numCtx": 49152,
+              "temperature": 0.2,
+              "maxOutput": 8192
+            }
+          ],
+          "description": "Models to pick from (Switch model menu). Each entry can override host, apiKey, numCtx, temperature, maxOutput for the current session. Default list matches VDS Coder presets."
         },
         "vdsx.outputDir": {
           "type": "string",

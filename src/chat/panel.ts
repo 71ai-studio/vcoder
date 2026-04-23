@@ -8,7 +8,7 @@ import { loadEcc, buildSystemPrompt, AgentDef, EccBundle } from '../ecc/loader';
 import { loadContextFiles, resolvePhaseAgents } from '../ecc/context-files';
 import { orchestrate, planToMarkdown, Plan } from '../agent/orchestrator';
 import { breakdownMessages, estimateTokens, formatBreakdown } from '../agent/token-estimate';
-import { getSchemas, ALL_TOOLS } from '../agent/tools/registry';
+import { getSchemas } from '../agent/tools/registry';
 import { ensureVdsxDir, timestamp } from '../util/vdsx-dir';
 import { runGitDiff, saveDiffToVdsx, isGitRepo } from '../util/git-helpers';
 
@@ -26,6 +26,9 @@ interface ModelEntry {
   model: string;
   host?: string;
   apiKey?: string;
+  numCtx?: number;
+  temperature?: number;
+  maxOutput?: number;
 }
 
 interface IncomingMsg {
@@ -403,20 +406,47 @@ export class ChatPanel {
     const cfg = vscode.workspace.getConfiguration('vdsx');
     const extras = cfg.get<ModelEntry[]>('ollama.models', []) || [];
     const defaultModel = cfg.get<string>('ollama.model', 'Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf');
-    const items: Array<{ label: string; detail?: string; entry: ModelEntry | null }> = [
-      { label: 'Default', detail: defaultModel, entry: null }
+    const defaultHost = cfg.get<string>('ollama.host', 'http://192.168.1.220:11434');
+    const defaultCtx = cfg.get<number>('ollama.numCtx', 49152);
+
+    const fmtDetail = (m: { model: string; host?: string; numCtx?: number; temperature?: number }) => {
+      const parts: string[] = [m.model];
+      if (m.host) parts.push(`@ ${m.host}`);
+      if (m.numCtx) parts.push(`ctx=${m.numCtx}`);
+      if (typeof m.temperature === 'number') parts.push(`T=${m.temperature}`);
+      return parts.join(' · ');
+    };
+
+    const items: Array<{ label: string; description?: string; detail?: string; entry: ModelEntry | null }> = [
+      {
+        label: 'Default (workspace settings)',
+        description: this.modelOverride ? '' : '✓ active',
+        detail: fmtDetail({ model: defaultModel, host: defaultHost, numCtx: defaultCtx }),
+        entry: null
+      }
     ];
-    for (const m of extras) items.push({ label: m.label, detail: m.model + (m.host ? ` @ ${m.host}` : ''), entry: m });
+    for (const m of extras) {
+      items.push({
+        label: m.label,
+        description: this.modelOverride?.label === m.label ? '✓ active' : '',
+        detail: fmtDetail(m),
+        entry: m
+      });
+    }
     if (items.length === 1) {
-      this.post({ type: 'info', text: 'No extra models configured. Add entries to vdsx.ollama.models in settings.json.' });
+      this.post({ type: 'info', text: 'No additional models in vdsx.ollama.models. Add entries via settings.json.' });
       return;
     }
-    const pick = await vscode.window.showQuickPick(items, { placeHolder: 'Choose model for subsequent calls' });
+    const pick = await vscode.window.showQuickPick(items, {
+      placeHolder: 'Pick a model — each preset can override host, apiKey, numCtx, temperature, maxOutput',
+      matchOnDescription: true,
+      matchOnDetail: true
+    });
     if (!pick) return;
     this.modelOverride = pick.entry;
     const label = pick.entry ? pick.label : '';
     this.panel.webview.postMessage({ type: 'modelChanged', label });
-    this.post({ type: 'info', text: `Model: ${pick.label}` });
+    this.post({ type: 'info', text: `Model: ${pick.label}${pick.detail ? ' — ' + pick.detail : ''}` });
   }
 
   private toggleThinking() {
@@ -667,24 +697,23 @@ export class ChatPanel {
     const baseApiKey = cfg.get<string>('ollama.apiKey', '');
     const baseHost = cfg.get<string>('ollama.host', 'http://192.168.1.220:11434');
     const baseModel = cfg.get<string>('ollama.model', 'Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf');
+    const baseCtx = cfg.get<number>('ollama.numCtx', 49152);
+    const baseTemp = cfg.get<number>('ollama.temperature', 0.2);
+    const baseOut = cfg.get<number>('ollama.maxOutput', 12000);
 
     const override = this.modelOverride;
     const host = override?.host ?? baseHost;
     const model = override?.model ?? baseModel;
     const apiKey = override?.apiKey ?? baseApiKey;
+    const numCtx = override?.numCtx ?? baseCtx;
+    const temperature = override?.temperature ?? baseTemp;
+    const maxOutput = override?.maxOutput ?? baseOut;
 
     if (!apiKey) {
-      this.post({ type: 'error', text: 'vdsx.ollama.apiKey is not set. Add it to VSCode settings.' });
+      this.post({ type: 'error', text: 'vdsx.ollama.apiKey is not set. Add it to VSCode settings, or pick a model with apiKey via Switch model menu.' });
       return null;
     }
-    return {
-      host,
-      model,
-      apiKey,
-      numCtx: cfg.get<number>('ollama.numCtx', 49152),
-      temperature: cfg.get<number>('ollama.temperature', 0.2),
-      maxOutput: cfg.get<number>('ollama.maxOutput', 12000)
-    };
+    return { host, model, apiKey, numCtx, temperature, maxOutput };
   }
 
   private async runDo(goal: string) {
