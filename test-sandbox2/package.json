@@ -1,8 +1,0 @@
-{
-  "name": "vdsx-sandbox2",
-  "version": "0.0.1",
-  "private": true,
-  "scripts": {
-    "test": "node -e \"const m=require('./math'); if(m.add(2,3)!==5){console.error('add fail');process.exit(1)} if(m.mul(4,5)!==20){console.error('mul fail');process.exit(1)} console.log('OK')\""
-  }
-}
