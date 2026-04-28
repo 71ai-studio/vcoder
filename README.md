@@ -1,128 +1,141 @@
-# VDS-X
+<p align="center">
+  <a href="https://opencode.ai">
+    <picture>
+      <source srcset="packages/console/app/src/asset/logo-ornate-dark.svg" media="(prefers-color-scheme: dark)">
+      <source srcset="packages/console/app/src/asset/logo-ornate-light.svg" media="(prefers-color-scheme: light)">
+      <img src="packages/console/app/src/asset/logo-ornate-light.svg" alt="OpenCode logo">
+    </picture>
+  </a>
+</p>
+<p align="center">The open source AI coding agent.</p>
+<p align="center">
+  <a href="https://opencode.ai/discord"><img alt="Discord" src="https://img.shields.io/discord/1391832426048651334?style=flat-square&label=discord" /></a>
+  <a href="https://www.npmjs.com/package/opencode-ai"><img alt="npm" src="https://img.shields.io/npm/v/opencode-ai?style=flat-square" /></a>
+  <a href="https://github.com/anomalyco/opencode/actions/workflows/publish.yml"><img alt="Build status" src="https://img.shields.io/github/actions/workflow/status/anomalyco/opencode/publish.yml?style=flat-square&branch=dev" /></a>
+</p>
 
-Local AI coding agent as a VSCode extension. Powered by **Ollama** (Qwen2.5-Coder 14B) and the **ECC (everything-claude-code)** architecture at **Layer B** — loads ECC agents, commands, and rules, maps Claude Code tool names to the local tool registry, and runs a tool-using agent loop.
+<p align="center">
+  <a href="README.md">English</a> |
+  <a href="README.zh.md">简体中文</a> |
+  <a href="README.zht.md">繁體中文</a> |
+  <a href="README.ko.md">한국어</a> |
+  <a href="README.de.md">Deutsch</a> |
+  <a href="README.es.md">Español</a> |
+  <a href="README.fr.md">Français</a> |
+  <a href="README.it.md">Italiano</a> |
+  <a href="README.da.md">Dansk</a> |
+  <a href="README.ja.md">日本語</a> |
+  <a href="README.pl.md">Polski</a> |
+  <a href="README.ru.md">Русский</a> |
+  <a href="README.bs.md">Bosanski</a> |
+  <a href="README.ar.md">العربية</a> |
+  <a href="README.no.md">Norsk</a> |
+  <a href="README.br.md">Português (Brasil)</a> |
+  <a href="README.th.md">ไทย</a> |
+  <a href="README.tr.md">Türkçe</a> |
+  <a href="README.uk.md">Українська</a> |
+  <a href="README.bn.md">বাংলা</a> |
+  <a href="README.gr.md">Ελληνικά</a> |
+  <a href="README.vi.md">Tiếng Việt</a>
+</p>
 
-## Stack
+[![OpenCode Terminal UI](packages/web/src/assets/lander/screenshot.png)](https://opencode.ai)
 
-- TypeScript + VSCode Extension API
-- OpenAI-compatible client (pure `fetch`) → `http://192.168.1.220:11434` — server is actually **llama.cpp** with OpenAI-compat `/v1/chat/completions`, not Ollama
-- Model: `Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf` (on RTX 3060)
-- Bearer API key auth required
-- `gray-matter` for YAML frontmatter
-- Tool registry: `read_file`, `write_file`, `edit_file`, `bash`, `grep`, `glob`
+---
 
-## Server quirks (important)
-
-The server at 192.168.1.220:11434 identifies as `llamacpp` (`system_fingerprint: b13-...`):
-
-- **Requires `Authorization: Bearer <key>`** — `vdsx.ollama.apiKey` must be set.
-- **Returns OpenAI format** (`choices[0].message.content`), not Ollama format.
-- **Does NOT emit structured `tool_calls[]`** with Qwen2.5-Coder (server likely not started with `--jinja`). Instead the model writes inline XML: `<tools>{"name":"...", "arguments":{...}}</tools>` inside `message.content`.
-- `src/agent/ollama.ts` has a **fallback parser** that extracts both `<tool_call>` and `<tools>` XML blocks into our internal `tool_calls` shape, so the loop works regardless.
-- `num_ctx` setting is ignored by this server (context is fixed at llama.cpp startup via `-c`). Kept in settings for portability.
-
-## Setup
+### Installation
 
 ```bash
-cd d:/Projects/vds-x
-npm install
-npm run build        # bundles to dist/extension.js
+# YOLO
+curl -fsSL https://opencode.ai/install | bash
+
+# Package managers
+npm i -g opencode-ai@latest        # or bun/pnpm/yarn
+scoop install opencode             # Windows
+choco install opencode             # Windows
+brew install anomalyco/tap/opencode # macOS and Linux (recommended, always up to date)
+brew install opencode              # macOS and Linux (official brew formula, updated less)
+sudo pacman -S opencode            # Arch Linux (Stable)
+paru -S opencode-bin               # Arch Linux (Latest from AUR)
+mise use -g opencode               # Any OS
+nix run nixpkgs#opencode           # or github:anomalyco/opencode for latest dev branch
 ```
 
-Confirm the server is reachable (with your bearer token):
+> [!TIP]
+> Remove versions older than 0.1.x before installing.
+
+### Desktop App (BETA)
+
+OpenCode is also available as a desktop application. Download directly from the [releases page](https://github.com/anomalyco/opencode/releases) or [opencode.ai/download](https://opencode.ai/download).
+
+| Platform              | Download                              |
+| --------------------- | ------------------------------------- |
+| macOS (Apple Silicon) | `opencode-desktop-darwin-aarch64.dmg` |
+| macOS (Intel)         | `opencode-desktop-darwin-x64.dmg`     |
+| Windows               | `opencode-desktop-windows-x64.exe`    |
+| Linux                 | `.deb`, `.rpm`, or AppImage           |
 
 ```bash
-curl -H "Authorization: Bearer <your-key>" http://192.168.1.220:11434/v1/models
+# macOS (Homebrew)
+brew install --cask opencode-desktop
+# Windows (Scoop)
+scoop bucket add extras; scoop install extras/opencode-desktop
 ```
 
-Quick smoke test of the tool-calling path:
+#### Installation Directory
+
+The install script respects the following priority order for the installation path:
+
+1. `$OPENCODE_INSTALL_DIR` - Custom installation directory
+2. `$XDG_BIN_DIR` - XDG Base Directory Specification compliant path
+3. `$HOME/bin` - Standard user binary directory (if it exists or can be created)
+4. `$HOME/.opencode/bin` - Default fallback
 
 ```bash
-VDSX_KEY=<your-key> node scripts/smoke.js
-# expect "TOOL CALLS DETECTED: 1"
+# Examples
+OPENCODE_INSTALL_DIR=/usr/local/bin curl -fsSL https://opencode.ai/install | bash
+XDG_BIN_DIR=$HOME/.local/bin curl -fsSL https://opencode.ai/install | bash
 ```
 
-## Run
+### Agents
 
-1. Open `d:/Projects/vds-x` in VSCode.
-2. Press **F5** — opens an Extension Development Host window.
-3. In the dev window, open a project folder (e.g. `d:/Projects/everything-claude-code` to exercise ECC loading).
-4. Run command **VDS-X: Open Chat** (Ctrl+Shift+P).
-5. Pick an agent from the dropdown (loaded from `.claude/agents/*.md`) or leave empty for default.
-6. Type a request, Ctrl+Enter to send.
+OpenCode includes two built-in agents you can switch between with the `Tab` key.
 
-## Settings (`settings.json`)
+- **build** - Default, full-access agent for development work
+- **plan** - Read-only agent for analysis and code exploration
+  - Denies file edits by default
+  - Asks permission before running bash commands
+  - Ideal for exploring unfamiliar codebases or planning changes
 
-```json
-{
-  "vdsx.ollama.host": "http://192.168.1.220:11434",
-  "vdsx.ollama.model": "Qwen2.5-Coder-14B-Instruct-Q4_K_M.gguf",
-  "vdsx.ollama.apiKey": "llm-apikey-...",
-  "vdsx.ollama.numCtx": 65536,
-  "vdsx.ollama.temperature": 0.2,
-  "vdsx.eccPaths": [".claude", "~/.claude"],
-  "vdsx.maxIterations": 20,
-  "vdsx.autoApprove": ["read_file", "grep", "glob"]
-}
-```
+Also included is a **general** subagent for complex searches and multistep tasks.
+This is used internally and can be invoked using `@general` in messages.
 
-## ECC integration (Layer B)
+Learn more about [agents](https://opencode.ai/docs/agents).
 
-`src/ecc/loader.ts` scans each `vdsx.eccPaths` root and collects:
+### Documentation
 
-- `agents/*.md` → `AgentDef { name, description, systemPrompt, tools[], model }`
-- `commands/*.md` → `CommandDef` (registered but not yet wired into UI)
-- `rules/**/*.md` → appended into system prompt
+For more info on how to configure OpenCode, [**head over to our docs**](https://opencode.ai/docs).
 
-### Claude → VDS-X tool name mapping
+### Contributing
 
-`src/ecc/tool-mapping.ts` — ECC agents declare tools in Claude Code's PascalCase (`tools: [Read, Edit, Bash]`). We map:
+If you're interested in contributing to OpenCode, please read our [contributing docs](./CONTRIBUTING.md) before submitting a pull request.
 
-| Claude name   | VDS-X registry |
-|---------------|----------------|
-| `Read`        | `read_file`    |
-| `Write`       | `write_file`   |
-| `Edit`        | `edit_file`    |
-| `MultiEdit`   | `edit_file`    |
-| `Bash`        | `bash`         |
-| `Grep`        | `grep`         |
-| `Glob`        | `glob`         |
-| `WebFetch`, `WebSearch`, `Task`, `TodoWrite`, `NotebookEdit`, `SlashCommand`, `BashOutput`, `KillBash` | (dropped — out of MVP scope) |
+### Building on OpenCode
 
-When an ECC agent is selected, the loop only exposes its declared tools to the model.
+If you are working on a project that's related to OpenCode and is using "opencode" as part of its name, for example "opencode-dashboard" or "opencode-mobile", please add a note to your README to clarify that it is not built by the OpenCode team and is not affiliated with us in any way.
 
-## Architecture
+### FAQ
 
-```
-extension.ts
-  └─ ChatPanel (webview)
-       ├─ loads EccBundle at open + on "Reload ECC"
-       ├─ user types → runAgent(messages, opts)
-       │    └─ loop: ollama.chat → assistant.tool_calls → run handler → append result → repeat
-       ├─ approval dialog via vscode.window.showWarningMessage
-       └─ streams updates back to webview
-```
+#### How is this different from Claude Code?
 
-## Not in MVP
+It's very similar to Claude Code in terms of capability. Here are the key differences:
 
-- Streaming tool calls (Ollama returns them only at end of message — fine for now)
-- Subagent / `Task` tool (ECC Layer C)
-- Hook engine (PreToolUse, PostToolUse, SessionStart, Stop)
-- Slash command palette (commands/ are loaded but not invocable from UI yet)
-- Inline diff preview (approval shows raw path + byte count only)
-- Session persistence across restarts
-- Markdown rendering in webview
+- 100% open source
+- Not coupled to any provider. Although we recommend the models we provide through [OpenCode Zen](https://opencode.ai/zen), OpenCode can be used with Claude, OpenAI, Google, or even local models. As models evolve, the gaps between them will close and pricing will drop, so being provider-agnostic is important.
+- Out-of-the-box LSP support
+- A focus on TUI. OpenCode is built by neovim users and the creators of [terminal.shop](https://terminal.shop); we are going to push the limits of what's possible in the terminal.
+- A client/server architecture. This, for example, can allow OpenCode to run on your computer while you drive it remotely from a mobile app, meaning that the TUI frontend is just one of the possible clients.
 
-## Known rough edges
+---
 
-- Local tool use is flakier than Claude. If the model emits malformed JSON for arguments, the tool returns an error and the loop continues — model usually recovers.
-- `num_ctx=65536` on Qwen2.5-Coder:14b Q4 uses a lot of VRAM; on 12GB (RTX 3060) this works but leaves little headroom. Drop to 32768 if OOM.
-- Webview uses `retainContextWhenHidden: true`; history stays until you close the panel.
-
-## Next steps
-
-Step 1 (this scaffold): ✅
-Step 2: streaming assistant text to UI
-Step 3: slash command palette wired to `commands/*.md`
-Step 4: inline diff preview before `write_file` / `edit_file`
-Step 5: session persistence + Stop hook equivalent
+**Join our community** [Discord](https://discord.gg/opencode) | [X.com](https://x.com/opencode)
