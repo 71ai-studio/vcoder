@@ -1,0 +1,23 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "ollama": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Ollama (local)",
+      "options": {
+        "baseURL": "{env:OLLAMA_BASE_URL}"
+      },
+      "models": {
+        "{env:OLLAMA_MODEL}": {
+          "name": "{env:OLLAMA_MODEL}",
+          "tool_call": true,
+          "limit": {
+            "context": {env:OLLAMA_NUM_CTX},
+            "output": 4096
+          }
+        }
+      }
+    }
+  },
+  "model": "ollama/{env:OLLAMA_MODEL}"
+}
