@@ -1,5 +1,5 @@
 {
-  description = "OpenCode development flake";
+  description = "Vcoder development flake";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
@@ -37,12 +37,12 @@
             node_modules = final.callPackage ./nix/node_modules.nix {
               inherit rev;
             };
-            opencode = final.callPackage ./nix/opencode.nix {
+            vcoder = final.callPackage ./nix/vcoder.nix {
               inherit node_modules;
             };
           in
           {
-            inherit opencode;
+            inherit vcoder;
           };
       };
 
@@ -52,13 +52,13 @@
           node_modules = pkgs.callPackage ./nix/node_modules.nix {
             inherit rev;
           };
-          opencode = pkgs.callPackage ./nix/opencode.nix {
+          vcoder = pkgs.callPackage ./nix/vcoder.nix {
             inherit node_modules;
           };
         in
         {
-          default = opencode;
-          inherit opencode;
+          default = vcoder;
+          inherit vcoder;
           # Updater derivation with fakeHash - build fails and reveals correct hash
           node_modules_updater = node_modules.override {
             hash = pkgs.lib.fakeHash;

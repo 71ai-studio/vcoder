@@ -1,3 +1,6 @@
+// This method is called when your extension is deactivated
+export function deactivate() {}
+
 import * as vscode from "vscode"
 
 const TERMINAL_NAME = "vcoder"
@@ -8,6 +11,7 @@ export function activate(context: vscode.ExtensionContext) {
   })
 
   const openTerminalDisposable = vscode.commands.registerCommand("vcoder.openTerminal", async () => {
+    // An vcoder terminal already exists => focus it
     const existingTerminal = vscode.window.terminals.find((t) => t.name === TERMINAL_NAME)
     if (existingTerminal) {
       existingTerminal.show()
@@ -17,7 +21,7 @@ export function activate(context: vscode.ExtensionContext) {
     await openTerminal()
   })
 
-  const addFilepathDisposable = vscode.commands.registerCommand("vcoder.addFilepathToTerminal", async () => {
+  let addFilepathDisposable = vscode.commands.registerCommand("vcoder.addFilepathToTerminal", async () => {
     const fileRef = getActiveFile()
     if (!fileRef) {
       return
@@ -39,6 +43,7 @@ export function activate(context: vscode.ExtensionContext) {
   context.subscriptions.push(openNewTerminalDisposable, openTerminalDisposable, addFilepathDisposable)
 
   async function openTerminal() {
+    // Create a new terminal in split screen
     const port = Math.floor(Math.random() * (65535 - 16384 + 1)) + 16384
     const terminal = vscode.window.createTerminal({
       name: TERMINAL_NAME,
@@ -64,6 +69,7 @@ export function activate(context: vscode.ExtensionContext) {
       return
     }
 
+    // Wait for the terminal to be ready
     let tries = 10
     let connected = false
     do {
@@ -77,6 +83,7 @@ export function activate(context: vscode.ExtensionContext) {
       tries--
     } while (tries > 0)
 
+    // If connected, append the prompt to the terminal
     if (connected) {
       await appendPrompt(port, `In ${fileRef}`)
       terminal.show()
@@ -105,17 +112,22 @@ export function activate(context: vscode.ExtensionContext) {
       return
     }
 
+    // Get the relative path from workspace root
     const relativePath = vscode.workspace.asRelativePath(document.uri)
     let filepathWithAt = `@${relativePath}`
 
+    // Check if there's a selection and add line numbers
     const selection = activeEditor.selection
     if (!selection.isEmpty) {
+      // Convert to 1-based line numbers
       const startLine = selection.start.line + 1
       const endLine = selection.end.line + 1
 
       if (startLine === endLine) {
+        // Single line selection
         filepathWithAt += `#L${startLine}`
       } else {
+        // Multi-line selection
         filepathWithAt += `#L${startLine}-${endLine}`
       }
     }
@@ -123,5 +135,3 @@ export function activate(context: vscode.ExtensionContext) {
     return filepathWithAt
   }
 }
-
-export function deactivate() {}
