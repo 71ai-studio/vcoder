@@ -1,0 +1,89 @@
+{
+  "name": "vcoder",
+  "displayName": "vcoder",
+  "description": "vcoder for VS Code",
+  "version": "0.1.0",
+  "private": true,
+  "publisher": "vcoder",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.94.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "vcoder.openTerminal",
+        "title": "Open vcoder",
+        "icon": {
+          "light": "images/button-dark.svg",
+          "dark": "images/button-light.svg"
+        }
+      },
+      {
+        "command": "vcoder.openNewTerminal",
+        "title": "Open vcoder in new tab",
+        "icon": {
+          "light": "images/button-dark.svg",
+          "dark": "images/button-light.svg"
+        }
+      },
+      {
+        "command": "vcoder.addFilepathToTerminal",
+        "title": "Add Filepath to Terminal"
+      }
+    ],
+    "menus": {
+      "editor/title": [
+        {
+          "command": "vcoder.openNewTerminal",
+          "group": "navigation"
+        }
+      ]
+    },
+    "keybindings": [
+      {
+        "command": "vcoder.openTerminal",
+        "title": "Run vcoder",
+        "key": "ctrl+escape",
+        "mac": "cmd+escape",
+        "win": "ctrl+escape",
+        "linux": "ctrl+escape"
+      },
+      {
+        "command": "vcoder.openNewTerminal",
+        "title": "Run vcoder",
+        "key": "ctrl+shift+escape",
+        "mac": "cmd+shift+escape",
+        "win": "ctrl+shift+escape",
+        "linux": "ctrl+shift+escape"
+      },
+      {
+        "command": "vcoder.addFilepathToTerminal",
+        "title": "vcoder: Insert At-Mentioned",
+        "key": "ctrl+alt+k",
+        "mac": "cmd+alt+k",
+        "win": "ctrl+alt+K",
+        "linux": "ctrl+alt+K"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "bun run package",
+    "compile": "bun run check-types && node esbuild.js",
+    "watch:esbuild": "node esbuild.js --watch",
+    "watch:tsc": "tsc --noEmit --watch --project tsconfig.json",
+    "package": "bun run check-types && node esbuild.js --production",
+    "check-types": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "20.x",
+    "@types/vscode": "^1.94.0",
+    "esbuild": "^0.25.3",
+    "typescript": "^5.8.3"
+  }
+}

@@ -1,0 +1,22 @@
+{
+  "name": "vcoder-server",
+  "version": "0.1.0",
+  "description": "vcoder runtime that backs the VS Code extension",
+  "private": true,
+  "type": "module",
+  "bin": {
+    "vcoder": "dist/index.js"
+  },
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "node build.cjs",
+    "watch": "node build.cjs --watch",
+    "check-types": "tsc --noEmit",
+    "start": "node dist/index.js"
+  },
+  "devDependencies": {
+    "@types/node": "20.x",
+    "esbuild": "^0.25.3",
+    "typescript": "^5.8.3"
+  }
+}
